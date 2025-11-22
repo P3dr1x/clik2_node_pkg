@@ -1,0 +1,20 @@
+In questo pacchetto come ti dicevo vorrei implementare il codice per il controllo del manipolatore aereo tramite un algoritmo di cinematica inversa ad anello chiuso (CLIK) a livello delle accelerazioni così come implementato in CLIK2_multi_dof.m. I primi step fino al calcolo delle matrici jacobiane e di inerzia sono già implementate perchè uguali al caso del clik1 (quello a livello delle velocità).
+
+Le principali differenze sono:
+
+1. c'è una retroazione anche a livello della velocità dell'end-effector. Penso che la dovrò ricavare tramite differenziazione dell'informazione di posizione che arriva dalla cinematica diretta. andrà aggiunto il guadagno k_err_xd che di default vorrei fosse uguale a 20.
+
+2. rispetto al codice MATLAB non considerare le forze esterne agenti sul sistema (termine h_dot). Oppure considera solo la forza peso e il thrust che dovrebbe avere per bilanciare il drone verticalmente nel caso di braccio in sleep.
+
+3. calcola i termini z1 e z2.
+
+3. costruisci la matrice aug_inertia che poi andrà invertita.
+
+4. considera solo le accelerazioni dei giunti che escono dalla formula 'acc = inv_aug_inertia * [z1;z2];', integrale due volte e ottieni quindi i riferimenti di posizione per i giunti del braccio.
+
+I nodi che vanno modificati sono:
+
+1. clik_uam_node: richiederà l'implementazione di questa cinematica inversa ad anello chiuso al livello delle accelerazioni
+2. planner: richiederà la pianificazione delle traiettorie dell'end-effector al livello delle accelerazioni.
+
+  
