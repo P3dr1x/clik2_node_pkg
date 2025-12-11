@@ -4,8 +4,10 @@
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/pose.hpp"
 #include "geometry_msgs/msg/pose_array.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/accel.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 #include "px4_msgs/msg/vehicle_local_position.hpp"
 #include "px4_msgs/msg/vehicle_attitude.hpp"
 #include "tf2_ros/buffer.h"
@@ -32,9 +34,10 @@ private:
   void run_polyline_trajectory();
   void vehicle_local_position_callback(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg);
   void vehicle_attitude_callback(const px4_msgs::msg::VehicleAttitude::SharedPtr msg);
-  void real_drone_pose_callback(const geometry_msgs::msg::Pose::SharedPtr msg);
+  void real_drone_pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
   void gazebo_pose_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg);
   void publish_desired_global_pose(const geometry_msgs::msg::Pose& pose);
+  void joint_state_callback(const sensor_msgs::msg::JointState::ConstSharedPtr msg);
 
   // Variabili membro necessarie (stesse della funzione copiata)
   geometry_msgs::msg::Pose desired_ee_pose_local_;
@@ -46,11 +49,19 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr desired_ee_velocity_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Accel>::SharedPtr desired_ee_accel_pub_;
 
+  // Joint state & EE pose subscriptions (per replicare funzionalità clik1)
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
+  sensor_msgs::msg::JointState current_joint_state_;
+  bool has_joint_state_ = false;
+  rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr ee_world_pose_sub_;
+  geometry_msgs::msg::Pose current_ee_pose_;
+  bool has_current_ee_pose_ = false;
+
   // Subscribers pose drone
   rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr vehicle_local_position_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleAttitude>::SharedPtr vehicle_attitude_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr gazebo_pose_sub_;
-  rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr real_drone_pose_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr real_drone_pose_sub_;
   px4_msgs::msg::VehicleLocalPosition vehicle_local_position_;
   px4_msgs::msg::VehicleAttitude vehicle_attitude_;
   bool has_vehicle_local_position_ = false;

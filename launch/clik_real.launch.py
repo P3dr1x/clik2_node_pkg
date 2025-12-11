@@ -75,13 +75,18 @@ def generate_launch_description():
         output='screen',
     )
 
-    # Avvio Micro XRCE Agent (necessario per esporre i topic PX4 su ROS 2)
-    microxrce_agent = ExecuteProcess(
-        cmd=[
-            'MicroXRCEAgent', 'serial', '--dev', px4_agent_dev, '-b', px4_agent_baud
-        ],
-        output='screen',
-        condition=IfCondition(real_system)
+    # Avvio Micro XRCE Agent (necessario per esporre i topic PX4 su ROS 2) con ritardo di 5s
+    microxrce_agent = TimerAction(
+        period=10.0,
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    'MicroXRCEAgent', 'serial', '--dev', px4_agent_dev, '-b', px4_agent_baud
+                ],
+                output='screen',
+                condition=IfCondition(real_system)
+            )
+        ]
     )
 
     world_to_base_link_broadcaster = Node(
@@ -155,7 +160,7 @@ def generate_launch_description():
         DeclareLaunchArgument('px4_agent_baud', default_value='921600', description='Baudrate per MicroXRCEAgent.'),
         # Be sure that MicroXRCEAgent is exposing PX4 topic on ROS2
         DeclareLaunchArgument('use_rviz', default_value='false', choices=['true', 'false'], description='Lancia RViz se true.'),
-    #microxrce_agent,
+    microxrce_agent,
     real_drone_pose_pub,
     world_to_base_link_broadcaster,
     xs_sdk_node,

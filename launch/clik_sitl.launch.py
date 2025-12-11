@@ -125,6 +125,17 @@ def generate_launch_description():
         output='screen'
     )
 
+    # Avvio Micro XRCE Agent in modalità UDP (SITL) con ritardo di 5s
+    microxrce_agent = TimerAction(
+        period=10.0,
+        actions=[
+            ExecuteProcess(
+                cmd=['MicroXRCEAgent', 'udp4', '-p', '8888'],
+                output='screen'
+            )
+        ]
+    )
+
     # Pubblica la configurazione di sleep via CLI (una volta sola)
     sleep_pose_pub = ExecuteProcess(
         cmd=[
@@ -188,6 +199,7 @@ def generate_launch_description():
         # Be sure that MicroXRCEAgent is exposing PX4 topic on ROS2
         DeclareLaunchArgument('use_rviz', default_value='false', choices=['true', 'false'], description='Lancia RViz se true.'),
     px4_sitl,
+    microxrce_agent,
     bridge,
     robot_state_publisher,
     joint_state_broadcaster_spawner,

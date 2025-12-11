@@ -11,7 +11,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 # Set per debuggare
-set(CMAKE_BUILD_TYPE Debug)
+#set(CMAKE_BUILD_TYPE Debug)
 
 set(CONTROLLER_INCLUDE_DEPENDS
   pinocchio
@@ -85,6 +85,7 @@ install(DIRECTORY
 install(PROGRAMS
   scripts/send_sleep_pose.py
   scripts/check_pinocchio.py
+  scripts/test_acc_ik_pinocchio.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -117,6 +118,7 @@ ament_target_dependencies(planner
   tf2_ros
   tf2_geometry_msgs
   pinocchio
+  sensor_msgs
   px4_ros_com
   px4_msgs
   ament_index_cpp
