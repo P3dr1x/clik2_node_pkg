@@ -14,6 +14,7 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/accel.hpp"
 #include "interbotix_xs_msgs/msg/joint_group_command.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 #include "geometry_msgs/msg/transform_stamped.hpp" 
@@ -32,7 +33,9 @@ private:
     void vehicle_local_position_callback(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg);
     void vehicle_attitude_callback(const px4_msgs::msg::VehicleAttitude::SharedPtr msg);
     void vehicle_odometry_callback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg);
+    void gazebo_odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
     void real_drone_pose_callback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg);
+    void real_drone_twist_callback(const geometry_msgs::msg::Twist::SharedPtr msg);
     void gazebo_pose_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg);
     void joint_state_callback(const sensor_msgs::msg::JointState::SharedPtr msg);
     void desired_pose_callback(const geometry_msgs::msg::Pose::SharedPtr msg);
@@ -53,15 +56,20 @@ private:
     rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr vehicle_local_position_sub_;
     rclcpp::Subscription<px4_msgs::msg::VehicleAttitude>::SharedPtr vehicle_attitude_sub_;
     rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr vehicle_odom_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr gazebo_odom_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr real_drone_pose_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr real_drone_twist_sub_;
     px4_msgs::msg::VehicleLocalPosition vehicle_local_position_;
     px4_msgs::msg::VehicleAttitude vehicle_attitude_;
     px4_msgs::msg::VehicleOdometry vehicle_odom_;
+    nav_msgs::msg::Odometry gazebo_odom_;
+    geometry_msgs::msg::Twist real_drone_twist_;
     bool has_vehicle_local_position_ = false;
     bool has_vehicle_attitude_ = false;
     bool has_vehicle_odom_ = false;
+    bool has_gazebo_odom_ = false;
+    bool has_real_drone_twist_ = false;
     bool use_gazebo_pose_;
-    bool use_odometry_twist_ = true;
 
     rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr gazebo_pose_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr desired_ee_global_pose_sub_;

@@ -284,14 +284,16 @@ def main():
         # Orientazione desiderata: manteniamo quella corrente (alpha_des = 0)
         R_des = R_cur
         T_des = pin.SE3(R_des, p_des_vec)
-        T_err = T_des * T_we.inverse()
-        # pin.log6 restituisce un oggetto pin.Motion; usiamo linear() e angular()
-        log6_err = pin.log6(T_err)
+        T_err = T_we.inverse() * T_des
+        # pin.log6(T_err) è un Motion nel frame locale dell'errore (locale all'EE corrente)
+        log6_err_local = pin.log6(T_err)
+        # Porta il twist d'errore in WORLD usando l'Adjoint della posa corrente dell'EE
+        log6_err_world = T_we.act(log6_err_local)
 
-        # Rimappa in [lin; ang] come nel nodo C++
+        # Rimappa in [lin; ang] come nel nodo C++ (WORLD)
         e6 = np.zeros(6)
-        e6[0:3] = np.array(log6_err.linear).reshape(3)   # parte lineare
-        e6[3:6] = np.array(log6_err.angular).reshape(3)  # parte angolare
+        e6[0:3] = np.array(log6_err_world.linear).reshape(3)
+        e6[3:6] = np.array(log6_err_world.angular).reshape(3)
 
         # Velocità EE desiderata e misurata (WORLD)
         v_ee_des = np.hstack([v_lin_des, omega_des])

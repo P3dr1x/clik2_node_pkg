@@ -1,20 +1,21 @@
-In questo pacchetto come ti dicevo vorrei implementare il codice per il controllo del manipolatore aereo tramite un algoritmo di cinematica inversa ad anello chiuso (CLIK) a livello delle accelerazioni così come implementato in CLIK2_multi_dof.m. I primi step fino al calcolo delle matrici jacobiane e di inerzia sono già implementate perchè uguali al caso del clik1 (quello a livello delle velocità).
+Perchè il CLIK2 funzioni ho bisogno della misura/stima della velocità (o meglio del twist) del drone.
 
-Le principali differenze sono:
+In simulazione vorrei usare le velocità del drone che sono pubblicate sul topic /model/t960a_0/odometry bridgato su ros2.
 
-1. c'è una retroazione anche a livello della velocità dell'end-effector. Penso che la dovrò ricavare tramite differenziazione dell'informazione di posizione che arriva dalla cinematica diretta. andrà aggiunto il guadagno k_err_xd che di default vorrei fosse uguale a 20.
+Nel caso di sistema reale invece vorrei usare la velocità letta da fmu/out/vehicle_odometry. La velocità angolare si può 
+ricavare dal campo angular_velocity mentre quella lineare da velocity.
 
-2. rispetto al codice MATLAB non considerare le forze esterne agenti sul sistema (termine h_dot). Oppure considera solo la forza peso e il thrust che dovrebbe avere per bilanciare il drone verticalmente nel caso di braccio in sleep.
+Nel topic fmu/out/vehicle_odometry il twist è pubblicato rispetto al frame NED. Io non posso assegnare questo twist come velocità del link base_link perchè
+la base free-flyer di pinocchio richiede che le velocità siano espresse nel frame body.
+È necessario dunque trasformare il twist letto da fmu/out/vehicle_odometry in modo che le componenti di velocità possano essere assegnate come componenti di velocità 
+della base free-flyer. 
+Per farlo credo che possiamo fare qualcosa di simile a ciò che viene fatto nel nodo real_drone_pose_pub. In questo caso dovrai creare un nodo che pubblica un twist 
+in frame FLU inizializzato con X = direzione di marcia iniziale, Y = sinistra, Z = alto. Bisognerà anche in questo caso dunque rimuovere il dato di yaw iniziale. Questo
+potrà ricavare da /fmu/out/vehicle_local_position (il nodo dovrà dunque iscriversi anche a questo topic).
+Il nodo si potrà chiamare real_drone_vel_pub.
+Attenzione: la angular_velocity è pubblicata sul topic vehicle_odometry rispetto al sistema body FRD. Ti è duqnue sufficiente trasformale nel sistema body FLU senza altre trasformazioni
+prima di pubblicarle (verifica questa informazione leggendo la documentazione PX4 a https://github.com/PX4/PX4-Autopilot/blob/main/msg/versioned/VehicleOdometry.msg).
 
-3. calcola i termini z1 e z2.
+Il nodo clik_uam_node dovrà quindi iscriversi al topic su cui è pubblicata la velocità espressa nel sistema FLU e trasformare la velocità lineare nel frame locale del drone (pinocchio richiede
+che la velocità della base free-flyer sia espressa nel frame body, come scritto in https://gepettoweb.laas.fr/doc/stack-of-tasks/pinocchio/devel/doxygen-html/structpinocchio_1_1JointModelFreeFlyerTpl.html)
 
-3. costruisci la matrice aug_inertia che poi andrà invertita.
-
-4. considera solo le accelerazioni dei giunti che escono dalla formula 'acc = inv_aug_inertia * [z1;z2];', integrale due volte e ottieni quindi i riferimenti di posizione per i giunti del braccio.
-
-I nodi che vanno modificati sono:
-
-1. clik_uam_node: richiederà l'implementazione di questa cinematica inversa ad anello chiuso al livello delle accelerazioni
-2. planner: richiederà la pianificazione delle traiettorie dell'end-effector al livello delle accelerazioni.
-
-  

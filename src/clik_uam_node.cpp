@@ -75,13 +75,29 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
             "/t960a/pose", 10, std::bind(&ClikUamNode::real_drone_pose_callback, this, std::placeholders::_1));
     }
 
-    // Sottoscrizione alla velocità/odometria del drone (PX4)
-    vehicle_odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
-        "/fmu/out/vehicle_odometry", rclcpp::SensorDataQoS(),
-        std::bind(&ClikUamNode::vehicle_odometry_callback, this, std::placeholders::_1));
-    RCLCPP_INFO(this->get_logger(), "Mi sottoscrivo a /fmu/out/vehicle_odometry (PX4 VehicleOdometry)");
+    // Sottoscrizione alla velocità/odometria del drone
+    // - Se uso la posa da Gazebo, sottoscrivo all'odometria del modello Gazebo
+    // - Mi iscrivo a /real_t960a_twist se NON uso la posa Gazebo
+    //   oppure se il sistema è reale (real_system_ == true)
+    if (use_gazebo_pose_)
+    {
+        // Simulazione: usa l'odometria del modello gazebo bridgiata su ROS2
+        gazebo_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            "/model/t960a_0/odometry", 10,
+            std::bind(&ClikUamNode::gazebo_odometry_callback, this, std::placeholders::_1));
+        RCLCPP_INFO(this->get_logger(), "use_gazebo_pose=true -> uso /model/t960a_0/odometry (nav_msgs/Odometry) per il twist del drone");
+    }
 
-    // Joint states: se reale, leggi da /<robot_name>/joint_states (xs_sdk); se SITL, da /joint_states (ros2_control)
+    if (!use_gazebo_pose_ || real_system_)
+    {
+        // Twist già trasformato in FLU (da real_drone_vel_pub, quando disponibile)
+        real_drone_twist_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+            "/real_t960a_twist", rclcpp::SensorDataQoS(),
+            std::bind(&ClikUamNode::real_drone_twist_callback, this, std::placeholders::_1));
+        RCLCPP_INFO(this->get_logger(), "!use_gazebo_pose_ || real_system_ -> mi iscrivo a /real_t960a_twist (Twist FLU) per il twist del drone");
+    }
+
+    // Joint states
     {
         std::string joint_states_topic;
         // if (real_system_) {
@@ -134,11 +150,9 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
 
     declare_parameter("k_err_pos_", 20.0);
     declare_parameter("k_err_vel_", 0.0);
-    declare_parameter("use_odometry_twist_", true);  // no mi ricordo perchè c'era questo
     this->declare_parameter<double>("joint_vel_limit", 3.14);
     k_err_pos_ = get_parameter("k_err_pos_").as_double();
     k_err_vel_ = get_parameter("k_err_vel_").as_double();
-    use_odometry_twist_ = get_parameter("use_odometry_twist_").as_bool();
     joint_vel_limit_ = this->get_parameter("joint_vel_limit").as_double();
     K_matrix_ = Eigen::MatrixXd::Identity(6, 6) * k_err_pos_;
     Kd_matrix_ = Eigen::MatrixXd::Identity(6, 6) * k_err_vel_;
@@ -241,6 +255,23 @@ void ClikUamNode::vehicle_odometry_callback(const px4_msgs::msg::VehicleOdometry
     has_vehicle_odom_ = true;
 }
 
+void ClikUamNode::gazebo_odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+    // In simulazione assumiamo che la twist di Gazebo sia espressa nel frame WORLD
+    // già in convenzione FLU, quindi non servono conversioni di frame qui.
+    gazebo_odom_ = *msg;
+    has_gazebo_odom_ = true;
+}
+
+void ClikUamNode::real_drone_twist_callback(const geometry_msgs::msg::Twist::SharedPtr msg)
+{
+    // Twist già espresso in:
+    // - lineare: WORLD-FLU con heading iniziale rimosso (da real_drone_vel_pub)
+    // - angolare: body FLU
+    real_drone_twist_ = *msg;
+    has_real_drone_twist_ = true;
+}
+
 void ClikUamNode::real_drone_pose_callback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
 {
     // Assumiamo che /t960a/pose sia in frame world FLU (come configurato in natnet_ros2)
@@ -280,8 +311,18 @@ void ClikUamNode::joint_state_callback(const sensor_msgs::msg::JointState::Share
     // Copia il messaggio
     current_joint_state_ = *msg;
 
-    // Se il topic non fornisce le velocità, stimale via differenze finite
-    if (current_joint_state_.velocity.empty() && !current_joint_state_.name.empty() && !current_joint_state_.position.empty())
+    // Se il topic non fornisce le velocità o contiene NaN/Inf, stimale via differenze finite
+    const bool names_ok = !current_joint_state_.name.empty();
+    const bool pos_ok   = !current_joint_state_.position.empty();
+    const bool vel_absent = current_joint_state_.velocity.empty();
+    bool vel_nonfinite = false;
+    if (!vel_absent) {
+        for (const auto &v : current_joint_state_.velocity) {
+            if (!std::isfinite(v)) { vel_nonfinite = true; break; }
+        }
+    }
+
+    if ((vel_absent || vel_nonfinite) && names_ok && pos_ok)
     {
         // Usa timestamp del messaggio se disponibile; altrimenti usa ora
         rclcpp::Time stamp = current_joint_state_.header.stamp;
@@ -300,11 +341,11 @@ void ClikUamNode::joint_state_callback(const sensor_msgs::msg::JointState::Share
                 const auto &jn = current_joint_state_.name[i];
                 const double q_now = current_joint_state_.position[i];
                 auto it = prev_joint_positions_.find(jn);
-                if (it != prev_joint_positions_.end()) {
+                if (it != prev_joint_positions_.end() && std::isfinite(q_now)) {
                     const double q_prev = it->second;
                     vel_est[i] = (q_now - q_prev) / dt;
                 } else {
-                    vel_est[i] = 0.0; // prima misura: velocità ignota -> 0
+                    vel_est[i] = 0.0; // prima misura o posizione non finita: velocità => 0
                 }
             }
         } else {
@@ -321,8 +362,8 @@ void ClikUamNode::joint_state_callback(const sensor_msgs::msg::JointState::Share
         }
         last_joint_state_time_ = stamp;
     } else {
-        // Aggiorna memoria posizioni e timestamp anche se le velocità sono fornite
-        if (!current_joint_state_.name.empty() && !current_joint_state_.position.empty()) {
+        // Aggiorna memoria posizioni e timestamp anche se le velocità sono fornite e finite
+        if (names_ok && pos_ok) {
             for (size_t i = 0; i < current_joint_state_.name.size(); ++i) {
                 prev_joint_positions_[current_joint_state_.name[i]] = current_joint_state_.position[i];
             }
@@ -379,56 +420,63 @@ void ClikUamNode::update()
     current_drone_pose.orientation.z = vehicle_attitude_.q[3];
     current_drone_pose.orientation.w = vehicle_attitude_.q[0];
 
-    // Velocità WORLD richieste dall'utente
+    // Velocità WORLD del drone
     Eigen::Vector3d vlin_base_world = Eigen::Vector3d::Zero();
     Eigen::Vector3d omega_base_world = Eigen::Vector3d::Zero();
-    if (use_odometry_twist_ && has_vehicle_odom_) {
-        // EKF PX4: linear velocity in NED, angular velocity in BODY_FRD (body-fixed).
-        // WORLD (Gazebo) ~ ENU. Convert:
-        // - Linear: NED -> ENU with [E, N, -D]
-        // - Angular: BODY_FRD -> FLU sign flip, then rotate to WORLD with Rwb
 
-        // Linear velocity: NED -> ENU -> WORLD(=ENU)
+    // Sorgenti disponibili:
+    //  - Twist FLU pubblicato da real_drone_vel_pub su /real_t960a_twist
+    //  - Odometria Gazebo (WORLD-FLU) su /model/t960a_0/odometry
+    // Nessuna più conversione NED/ENU e nessuna differenziazione numerica
+
+    if (has_real_drone_twist_)
+    {
+        // Parte lineare in WORLD-FLU (heading iniziale già rimosso)
         vlin_base_world = Eigen::Vector3d(
-            vehicle_odom_.velocity[1],    // E
-            vehicle_odom_.velocity[0],    // N
-            -vehicle_odom_.velocity[2]    // U = -D
+            real_drone_twist_.linear.x,
+            real_drone_twist_.linear.y,
+            real_drone_twist_.linear.z
         );
-
-        // Angular velocity: BODY_FRD -> FLU -> WORLD using base orientation
-        Eigen::Vector3d w_body_flu(
-            vehicle_odom_.angular_velocity[0],
-            -vehicle_odom_.angular_velocity[1],
-            -vehicle_odom_.angular_velocity[2]
-        );
-        Eigen::Quaterniond q_world_base(vehicle_attitude_.q[0], vehicle_attitude_.q[1], vehicle_attitude_.q[2], vehicle_attitude_.q[3]);
-        Eigen::Matrix3d Rwb = q_world_base.normalized().toRotationMatrix();
-        omega_base_world = Rwb * w_body_flu;
-    } else if (have_last_drone_) {
-        double dtb = (now - last_drone_time_).seconds();
-        if (dtb > 1e-6) {
-            vlin_base_world.x() = (current_drone_pose.position.x - last_drone_pose_world_.position.x) / dtb;
-            vlin_base_world.y() = (current_drone_pose.position.y - last_drone_pose_world_.position.y) / dtb;
-            vlin_base_world.z() = (current_drone_pose.position.z - last_drone_pose_world_.position.z) / dtb;
-
-            Eigen::Quaterniond q_now(current_drone_pose.orientation.w, current_drone_pose.orientation.x, current_drone_pose.orientation.y, current_drone_pose.orientation.z);
-            Eigen::Quaterniond q_prev(last_drone_pose_world_.orientation.w, last_drone_pose_world_.orientation.x, last_drone_pose_world_.orientation.y, last_drone_pose_world_.orientation.z);
-            Eigen::Quaterniond dq = q_now * q_prev.conjugate();
-            if (dq.w() < 0) dq.coeffs() *= -1.0;
-            Eigen::AngleAxisd aa(dq);
-            omega_base_world = aa.axis() * aa.angle() / dtb;
-        }
+        // La parte angolare viene letta direttamente come body FLU più sotto
     }
-    last_drone_pose_world_ = current_drone_pose;
-    last_drone_time_ = now;
-    have_last_drone_ = true;
+    else if (use_gazebo_pose_ && has_gazebo_odom_)
+    {
+        // Simulazione: assumiamo che la twist di Gazebo sia già in WORLD-FLU
+        vlin_base_world = Eigen::Vector3d(
+            gazebo_odom_.twist.twist.linear.x,
+            gazebo_odom_.twist.twist.linear.y,
+            gazebo_odom_.twist.twist.linear.z
+        );
+
+        omega_base_world = Eigen::Vector3d(
+            gazebo_odom_.twist.twist.angular.x,
+            gazebo_odom_.twist.twist.angular.y,
+            gazebo_odom_.twist.twist.angular.z
+        );
+    }
 
     // --- VERIFICARE: Stima velocità generalizzata v (Pinocchio richiede LOCAL per la base free-flyer) ---
-    // Converti WORLD -> LOCAL usando R^T
+    // Converti WORLD -> LOCAL usando R^T per la parte lineare.
+    // La parte angolare, nel caso reale, arriva già in body FLU da real_drone_vel_pub.
     Eigen::Quaterniond q_world_base(vehicle_attitude_.q[0], vehicle_attitude_.q[1], vehicle_attitude_.q[2], vehicle_attitude_.q[3]);
     Eigen::Matrix3d Rwb = q_world_base.normalized().toRotationMatrix();
-    Eigen::Vector3d omega_base_local = Rwb.transpose() * omega_base_world;
     Eigen::Vector3d vlin_base_local = Rwb.transpose() * vlin_base_world;
+
+    Eigen::Vector3d omega_base_local;
+    if (has_real_drone_twist_)
+    {
+        // Twist angolare già in frame body FLU
+        omega_base_local = Eigen::Vector3d(
+            real_drone_twist_.angular.x,
+            real_drone_twist_.angular.y,
+            real_drone_twist_.angular.z
+        );
+    }
+    else
+    {
+        // Caso Gazebo o assenza di real_drone_twist_: ruota da WORLD a LOCAL
+        omega_base_local = Rwb.transpose() * omega_base_world;
+    }
 
 
     // 1. AGGIORNO STATO GIUNTI BRACCIO
@@ -456,7 +504,7 @@ void ClikUamNode::update()
                 // Mappatura empirica come per le posizioni (free-flyer joints occupano prime 7 posizioni in q, 6 in v)
                 int col = jidx_int - 2; // corrispondente a ordine manipolatore dopo base (adattato al codice esistente)
                 if (col >= 0 && (6 + col) < model_.nv && i < current_joint_state_.velocity.size()) {
-                    qd_[6 + col] = current_joint_state_.velocity[i];  //MA LA VELOCITY CE L'HO?
+                    qd_[6 + col] = current_joint_state_.velocity[i];  
                 }
             }
         }
@@ -464,10 +512,38 @@ void ClikUamNode::update()
 
     // Generalized velocity misurata (usa velocità drone misurate + velocità giunti misurate)
     Eigen::VectorXd v_gen_meas(model_.nv); v_gen_meas.setZero();
-    v_gen_meas.segment<3>(0) = omega_base_local; // base angolare 
-    v_gen_meas.segment<3>(3) = vlin_base_local;  // base lineare 
+    v_gen_meas.segment<3>(0) = vlin_base_local;  // base lineare 
+    v_gen_meas.segment<3>(3) = omega_base_local; // base angolare 
     // copia giunti
     for (int k = 6; k < model_.nv; ++k) v_gen_meas[k] = qd_[k];
+
+    // Debug: stampa le componenti di v_gen_meas ([lin; ang] base in LOCAL e giunti)
+    {
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss.precision(4);
+        oss << "v_gen_meas: base_local=["
+            << v_gen_meas[0] << ", " << v_gen_meas[1] << ", " << v_gen_meas[2] << " | "
+            << v_gen_meas[3] << ", " << v_gen_meas[4] << ", " << v_gen_meas[5] << "], joints=["
+            << v_gen_meas.tail(model_.nv - 6).transpose() << "]";
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200, "%s", oss.str().c_str());
+        
+        bool has_nan_base = false;
+        for (int i = 0; i < 6; ++i) {
+            if (!std::isfinite(v_gen_meas[i])) { has_nan_base = true; break; }
+        }
+        if (has_nan_base) {
+            RCLCPP_WARN(this->get_logger(), "v_gen_meas contiene NaN/Inf nelle componenti base [0:5]");
+        }
+        
+        bool has_nan_joints = false;
+        for (int i = 6; i < model_.nv; ++i) {
+            if (!std::isfinite(v_gen_meas[i])) { has_nan_joints = true; break; }
+        }
+        if (has_nan_joints) {
+            RCLCPP_WARN(this->get_logger(), "v_gen_meas contiene NaN/Inf nelle componenti giunti [6:nv]");
+        }
+    }
 
     // 2. CINEMATICA DIRETTA PER POSA GLOBALE CORRENTE EE
 
@@ -559,8 +635,8 @@ void ClikUamNode::update()
     pinocchio::SE3 T_des(R_des, p_des);
 
     // Errore di posa SE3 in WORLD: T_err = T_des * T_cur^{-1}
-    pinocchio::SE3 T_err = T_des * ee_placement.inverse();
-    //pinocchio::SE3 T_err = T_des.inverse() * ee_placement;
+    //pinocchio::SE3 T_err = T_des * ee_placement.inverse();
+    pinocchio::SE3 T_err = ee_placement.inverse()* T_des;
 
     // Logaritmo su SE(3) restituisce un twist nel frame locale del termine di errore.
     // Convertiamolo al frame WORLD usando l'Adjoint della posa corrente dell'EE.
@@ -569,27 +645,6 @@ void ClikUamNode::update()
     const Eigen::Matrix<double,6,1> err_world_al = Ad_world_from_cur * err_body_al; 
     error_pose_ee_.head<3>() = err_world_al.head<3>(); // lin in WORLD
     error_pose_ee_.tail<3>() = err_world_al.tail<3>(); // ang in WORLD
-    //err_se3.tail<3>().setZero(); // azzero per sicurezza
-    //error_pose_ee_ = err_se3;
-    //error_pose_ee_.head<3>() = err_se3.;
-    // error_pose_ee_.tail<3>().setZero();
-    //error_pose_ee_.tail<3>() = err_se3.angular();
-
-    // // Errore di posizione (solo parte lineare) in WORLD: [lin; ang]
-    // const Eigen::Vector3d p_cur = ee_placement.translation();
-    // // error_pose_ee_.head<3>() = p_des - p_cur;
-    // // error_pose_ee_.tail<3>().setZero();
-
-    // const Eigen::Vector3d e_pos = p_des - p_cur; // world
-
-    // // - Orientazione: errore angolare in world e_w = log( R_des * R_cur^T )
-    // Eigen::Matrix3d R_cur = ee_placement.rotation();
-    // Eigen::Matrix3d R_err_world = R_des * R_cur.transpose();
-    // const Eigen::Vector3d e_ang = pinocchio::log3(R_err_world); // world
-
-    // Eigen::Matrix<double,6,1> e6;
-    // error_pose_ee_.head<3>() = e_pos;
-    // error_pose_ee_.tail<3>() = e_ang;
 
     // 6. CALCOLO ERRORE DI VELOCITÀ END-EFFECTOR
 
@@ -598,6 +653,25 @@ void ClikUamNode::update()
     Eigen::VectorXd v_ee_meas(6); // [lin; ang] per coerenza con v_ee_des
     v_ee_meas.head<3>() = ee_vel_motion.linear();
     v_ee_meas.tail<3>() = ee_vel_motion.angular();
+
+    // Debug: stampa la velocità EE misurata e controlla componenti non finite
+    // {
+    //     std::ostringstream oss;
+    //     oss.setf(std::ios::fixed);
+    //     oss.precision(6);
+    //     oss << "ee_vel_motion (WORLD) lin=["
+    //         << v_ee_meas[0] << ", " << v_ee_meas[1] << ", " << v_ee_meas[2]
+    //         << "] ang=[" << v_ee_meas[3] << ", " << v_ee_meas[4] << ", " << v_ee_meas[5] << "]";
+    //     RCLCPP_INFO(this->get_logger(), "%s", oss.str().c_str());
+    //     bool has_nan = false;
+    //     for (int i = 0; i < 6; ++i) {
+    //         if (!std::isfinite(v_ee_meas[i])) { has_nan = true; break; }
+    //     }
+    //     if (has_nan) {
+    //         RCLCPP_WARN(this->get_logger(), "ee_vel_motion contiene NaN/Inf: controlla J, v_gen_meas, frame WORLD");
+    //     }
+    // }
+
     error_vel_ee_ = v_ee_des - v_ee_meas;
 
 
@@ -630,22 +704,22 @@ void ClikUamNode::update()
     Eigen::VectorXd Jdot_v = Jdot * v_gen_ik;
     // Feed-forward kinematico
     Eigen::VectorXd z2_ff = acc_ee_des - Jdot_v;
-    Eigen::VectorXd z2_fb = K_matrix_ * error_pose_ee_;// + Kd_matrix_ * error_vel_ee_;
+    Eigen::VectorXd z2_fb = K_matrix_ * error_pose_ee_ + Kd_matrix_ * error_vel_ee_;
     Eigen::VectorXd z2    = z2_ff + z2_fb; // totale (solo per riferimento)
 
     // Stampa dell'errore di posa dell'end-effector (tutte e 6 le componenti)
-    {
-        std::ostringstream oss;
-        oss.setf(std::ios::fixed);
-        oss.precision(6);
-        oss << "error_pose_ee_ = [";
-        for (int i = 0; i < error_pose_ee_.size(); ++i) {
-            oss << error_pose_ee_[i];
-            if (i + 1 < error_pose_ee_.size()) oss << ", ";
-        }
-        oss << "]";
-        RCLCPP_INFO(this->get_logger(), "%s", oss.str().c_str());
-    }
+    // {
+    //     std::ostringstream oss;
+    //     oss.setf(std::ios::fixed);
+    //     oss.precision(6);
+    //     oss << "error_pose_ee_ = [";
+    //     for (int i = 0; i < error_pose_ee_.size(); ++i) {
+    //         oss << error_pose_ee_[i];
+    //         if (i + 1 < error_pose_ee_.size()) oss << ", ";
+    //     }
+    //     oss << "]";
+    //     RCLCPP_INFO(this->get_logger(), "%s", oss.str().c_str());
+    // }
 
     // 8. CALCOLO z1 = z_dyn = h0_dot = - dAg * v
 
@@ -704,7 +778,7 @@ void ClikUamNode::update()
         Wc_inv.block(6, 6, m_total, m_total) = W_inv_vec.asDiagonal();
 
         Eigen::MatrixXd A = Aug_red;
-        Eigen::MatrixXd AwAt = A * Wc_inv * A.transpose();          // 9x9
+        Eigen::MatrixXd AwAt = A * Wc_inv * A.transpose();          
         const double damping = 1e-6;
         Eigen::MatrixXd AwAt_reg = AwAt + damping * Eigen::MatrixXd::Identity(AwAt.rows(), AwAt.cols());
         Eigen::MatrixXd AwAt_inv = AwAt_reg.ldlt().solve(Eigen::MatrixXd::Identity(AwAt.rows(), AwAt.cols()));
@@ -721,77 +795,54 @@ void ClikUamNode::update()
         qdd_total = acc_total.tail(m_total); // accelerazioni giunti totali (ff + fb)
     }
 
-    // Se compaiono NaN/Inf nelle accelerazioni, stampa diagnostica dettagliata
-    auto has_nonfinite = [](const Eigen::VectorXd &v) {
-        for (Eigen::Index i = 0; i < v.size(); ++i) {
-            if (!std::isfinite(v[i])) {
-                return true;
-            }
-        }
-        return false;
-    };
-    const bool nan_total = has_nonfinite(qdd_total);
-    if (nan_total && update_iterations_after_guard_ <= 20) {
-        // Indici non finiti
-        auto nonfinite_indices = [](const Eigen::VectorXd &v) {
-            std::ostringstream os; os << "[";
-            bool first=true; for (Eigen::Index i=0;i<v.size();++i){ if(!std::isfinite(v[i])){ if(!first) os<<","; os<<i; first=false; }}
-            os << "]"; return os.str();
-        };
-        // Norme scalari utili
-        double n_z1 = z1.norm();
-        double n_z2ff = z2_ff.norm();
-        double n_z2fb = z2_fb.norm();
-        // Check Jdot_v se calcolato
-        // (Jdot_v già esiste sopra)
-        double n_Jdotv = Jdot_v.norm();
-        // Rank e SVD dell'Augmentata
-        Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(Aug);
-        int rank = qr.rank();
-        Eigen::JacobiSVD<Eigen::MatrixXd> svd(Aug, Eigen::ComputeThinU | Eigen::ComputeThinV);
-        const auto &S = svd.singularValues();
-        double s_max = (S.size()>0? S(0) : 0.0);
-        double s_min = (S.size()>0? S(S.size()-1) : 0.0);
-        // Riepilogo breve su prime voci per i giunti del braccio
-        size_t n_print = std::min(static_cast<size_t>(m_total), arm_joints_.size());
-        std::ostringstream os_total;
-        os_total.setf(std::ios::fixed); os_total.precision(3);
-        for (size_t i=0;i<n_print;++i){
-            os_total << (std::isfinite(qdd_total(static_cast<Eigen::Index>(i)))? qdd_total(static_cast<Eigen::Index>(i)) : std::numeric_limits<double>::quiet_NaN());
-            if (i+1<n_print){ os_total << ", "; }
-        }
-        RCLCPP_WARN(this->get_logger(), "NaN in qdd_total rilevato. idx=%s",
-                    nonfinite_indices(qdd_total).c_str());
-        RCLCPP_WARN(this->get_logger(), "Norme: |z1|=%.3e |z2_ff|=%.3e |z2_fb|=%.3e |Jdot*v|=%.3e",
-                    n_z1, n_z2ff, n_z2fb, n_Jdotv);
-        RCLCPP_WARN(this->get_logger(), "Aug dims=%ldx%ld rank=%d s_max=%.3e s_min=%.3e", Aug.rows(), Aug.cols(), rank, s_max, s_min);
-        RCLCPP_WARN(this->get_logger(), "qdd_total(first %zu)=[%s]", n_print, os_total.str().c_str());
-    }
+    // // Se compaiono NaN/Inf nelle accelerazioni, stampa diagnostica dettagliata
+    // auto has_nonfinite = [](const Eigen::VectorXd &v) {
+    //     for (Eigen::Index i = 0; i < v.size(); ++i) {
+    //         if (!std::isfinite(v[i])) {
+    //             return true;
+    //         }
+    //     }
+    //     return false;
+    // };
+    // const bool nan_total = has_nonfinite(qdd_total);
+    // if (nan_total && update_iterations_after_guard_ <= 20) {
+    //     // Indici non finiti
+    //     auto nonfinite_indices = [](const Eigen::VectorXd &v) {
+    //         std::ostringstream os; os << "[";
+    //         bool first=true; for (Eigen::Index i=0;i<v.size();++i){ if(!std::isfinite(v[i])){ if(!first) os<<","; os<<i; first=false; }}
+    //         os << "]"; return os.str();
+    //     };
+    //     // Norme scalari utili
+    //     double n_z1 = z1.norm();
+    //     double n_z2ff = z2_ff.norm();
+    //     double n_z2fb = z2_fb.norm();
+    //     // Check Jdot_v se calcolato
+    //     // (Jdot_v già esiste sopra)
+    //     double n_Jdotv = Jdot_v.norm();
+    //     // Rank e SVD dell'Augmentata
+    //     Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(Aug);
+    //     int rank = qr.rank();
+    //     Eigen::JacobiSVD<Eigen::MatrixXd> svd(Aug, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    //     const auto &S = svd.singularValues();
+    //     double s_max = (S.size()>0? S(0) : 0.0);
+    //     double s_min = (S.size()>0? S(S.size()-1) : 0.0);
+    //     // Riepilogo breve su prime voci per i giunti del braccio
+    //     size_t n_print = std::min(static_cast<size_t>(m_total), arm_joints_.size());
+    //     std::ostringstream os_total;
+    //     os_total.setf(std::ios::fixed); os_total.precision(3);
+    //     for (size_t i=0;i<n_print;++i){
+    //         os_total << (std::isfinite(qdd_total(static_cast<Eigen::Index>(i)))? qdd_total(static_cast<Eigen::Index>(i)) : std::numeric_limits<double>::quiet_NaN());
+    //         if (i+1<n_print){ os_total << ", "; }
+    //     }
+    //     RCLCPP_WARN(this->get_logger(), "NaN in qdd_total rilevato. idx=%s",
+    //                 nonfinite_indices(qdd_total).c_str());
+    //     RCLCPP_WARN(this->get_logger(), "Norme: |z1|=%.3e |z2_ff|=%.3e |z2_fb|=%.3e |Jdot*v|=%.3e",
+    //                 n_z1, n_z2ff, n_z2fb, n_Jdotv);
+    //     RCLCPP_WARN(this->get_logger(), "Aug dims=%ldx%ld rank=%d s_max=%.3e s_min=%.3e", Aug.rows(), Aug.cols(), rank, s_max, s_min);
+    //     RCLCPP_WARN(this->get_logger(), "qdd_total(first %zu)=[%s]", n_print, os_total.str().c_str());
+    // }
 
-    // Debug: avvisa se accelerazioni sono NaN o oltre una soglia ragionevole
-    {
-        const double acc_warn_threshold = 50.0; // rad/s^2
-        const size_t n_arm = arm_joints_.size();
-        const size_t n_avail = static_cast<size_t>(qdd_total.size());
-        const size_t n = std::min(n_arm, n_avail);
-        bool any_bad = false;
-        std::ostringstream oss;
-        for (size_t i = 0; i < n; ++i) {
-            const double a = qdd_total[static_cast<Eigen::Index>(i)];
-            if (!std::isfinite(a) || std::abs(a) > acc_warn_threshold) {
-                if (!any_bad) {
-                    oss.setf(std::ios::fixed); oss.precision(3);
-                }
-                any_bad = true;
-                oss << arm_joints_[i] << "= " << (std::isfinite(a) ? a : std::numeric_limits<double>::quiet_NaN()) << " ";
-            }
-        }
-        if (any_bad) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 200, "Accel anomala (rad/s^2): %s", oss.str().c_str());
-        }
-    }
-
-    // Integrazione separata accelerazioni -> velocità -> posizione
+    // Integrazione accelerazioni -> velocità -> posizione
     const rclcpp::Time now_int = this->now();
     double dt = (now_int - last_update_time_).seconds();
     last_update_time_ = now_int;
