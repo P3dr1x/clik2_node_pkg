@@ -111,6 +111,9 @@ private:
     // Ridondanza cinematica (ignora orientazione se true)
     bool redundant_ = false;
 
+    // In modalità redundant, scala il feedback sulla parte angolare dell'EE (0 = nessun feedback angolare, 1 = pieno)
+    double redundant_ang_fb_scale_ = 0.05;
+
     // Timing controllo
     rclcpp::Time last_update_time_;
     double desired_timeout_sec_ = 0.0;

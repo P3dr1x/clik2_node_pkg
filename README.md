@@ -10,7 +10,6 @@ The UAM is composed by:
   <img src="media/UAM.gif" alt="UAM">
 </div>
 
-This code for now allows to keep the end-effector at a certain pose and to track a circular trajectory.
 
 ## Prerequisites
 
@@ -42,10 +41,6 @@ In the first terminal launch
 ```bash
 ros2 launch clik2_node_pkg clik_sitl.launch.py
 ```
-If you want to subscribe to the simulated signals coming from PX4 for getting drone pose use `ros2 launch clik2_node_pkg clik_sitl.launch.py real_system:=true`. Pose data are taken from the `/real_t960a_pose` topic.
-
-> [!NOTE] 
-> Be sure that PX4 topics are exposed to ROS2. If in SITL simulation run `sudo MicroXRCEAgent udp4 -p 8888` in another terminal.
 
 If you want also Rviz visualization in order to see the desired pose vs the actual one, in another terninal launch
 
@@ -68,15 +63,15 @@ If no or invalid input is given by the user, the desired relative EE pose comman
 For running the controller 
 
 ```bash
-ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_x_:=50.0
+ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=60.0 -p k_err_vel_:=60.0
 ```
 
 
 > [!NOTE] 
-> By default the node runs with the parameter `use_gazebo_pose:=true`. This means that the node will try to subscribe to the `/world/default/dynamic_pose/info` topic bridged from Gazebo to ROS2 for getting the UAV pose. 
+> By default the node runs with the parameter `use_gazebo_pose:=true`. This means that the node will try to subscribe to the `/world/default/dynamic_pose/info` topic bridged from Gazebo to ROS2 for getting the UAV pose and to the `/model/t960a_0/odometry` topic for UAV twist. 
 
 <div align="center">
-  <img src="media/GIF_Rviz.gif" alt="UAM">
+  <img src="media/cerchio_uam.gif" alt="UAM">
 </div>
 
 ## Node parameters
@@ -84,8 +79,13 @@ ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_x_:=50.0
 Parameter      |Default value |   Description    |
 |-------------------|---------------|------------|
 | `use_gazebo_pose` | `true` | The node will try to subscribe to the `/world/default/dynamic_pose/info` topic bridged from Gazebo to ROS2 for getting the UAV pose. 
-| `k_err_x_` | `50.0` | Is the gain value for the EE feedback 
+| `k_err_pos_` | `60.0` | Is the proportional gain value for the EE feedback
+| `k_err_vel_` | `60.0` | Is the derivative gain value for the EE feedback  
 | `real_system` | `false` | In some nodes is this parameter that decides if to subscribe to the `/real_t960a_pose` topic
+| `use_gz_odom` | `true` | If `false` the node will try to subscribe to `/real_t960a_twist` to get the UAV twist. Make sure that also the launch file was launched with `use_gz_odom=false` in that case
+| `redundant` | `false` | Choose wether you want to command both position and orientation to the EE or only the position (in that case set `true`). **At the moment it does not work as intended**
+| `control_rate_hz` | `100.0` | Frequency at which the `update()` loop of the controller node will operate.
+| `<joint_name>_weight` | `15.0`, `25.0` | Set the weight of the specific joint. This influences the weight matrix used in the weighted pseudoinversion. You can choose `shoulder`, `forearm_roll`, `wrist_rotate` joints.
 
 
 ## Usage with real system (Motion Capture)
@@ -120,7 +120,7 @@ This should also open a Rviz session where it is possible to visualize the confi
 
 6. Run the controller
 ```bash
-ros2 run clik2_node_pkg clik_uam_node --ros-args -p real_system:=true
+ros2 run clik2_node_pkg clik_uam_node --ros-args -p real_system:=true -p k_err_pos_:=60.0 -p k_err_vel_:=60.0 -p control_rate_hz:=120.0
 ```
 7. Run the planner
 ```bash
@@ -131,18 +131,25 @@ ros2 run clik2_node_pkg planner
 
 ## Mathematics
 
-The algorithm computes in real-time the reference velocities to manipulators motors must have in order to keep the EE at the desired global pose. This is done through:
+The algorithm computes in real-time the reference accelerations that manipulators motors must have in order to track the desired trajectory. This is done through:
 
-$$\dot{\mathbf{q}} = [\mathbf{J}_{\text{gen}}]^{\dagger}[\mathbf{K}]\mathbf{e}_x$$
+$$ \left\{ \begin{array}{cc} \ddot{\mathbf{q}}_b \\ \ddot{\mathbf{q}}_m \end{array} \right\} = \left[
+\begin{array}{cc}
+[\mathbf{A}_{b}] & [\mathbf{A}_{m}] \\
+[\mathbf{J}_{b}] & [\mathbf{J}_{m}]
+\end{array} \right]^\dagger
+\left\{ \begin{array}{cc} \mathbf{z}_1 \\ \mathbf{z}_2 \end{array} \right\}
+$$
 
 where:
 
-- $[\mathbf{J}_{\text{gen}}]$ is the **Generalized Jacobian matrix**.
-- $[\mathbf{K}]$ is the gain matrix. For now is simply `k_err_x_*Identity(6,6)`.
-- $\mathbf{e}_{x}$ is EE pose error vector. It is computed as $\mathbf{e}_{x} = \log_{se(3)}([\mathbf{T}_{w,e}]_{des}[\mathbf{T}_{w,e}]^{-1})$.
+- $[\mathbf{A}_{b}] , [\mathbf{A}_{m}]$ are the **Centroidal Momentum Matrices** relative to the base and the manipulator respectively.
+- $[\mathbf{J}_{b}] , [\mathbf{J}_{m}]$ are the **Jacobian Matrices** mapping base and joints generalized velocities to end-effector twist.
+- $\mathbf{z}_1 = -[\dot{\mathbf{A}}]\dot{\mathbf{q}}$
+- $\mathbf{z}_2 = \mathbf{a}_{\text{e,des}} - [\dot{\mathbf{J}}]\dot{\mathbf{q}} + [\mathbf{K}_P]\mathbf{e} + [\mathbf{K}_D]\dot{\mathbf{e}}$
+- $[\mathbf{K}_P]$ is the proportional gain matrix. $[\mathbf{K}_D]$ is the derivative gain matrix.
+- $\mathbf{e}$ is EE pose error vector. $\dot{\mathbf{e}}$ is the EE velocity error.
 
-For more info check the papers (please consider citing):
-
-- [Pasetto, A.; Vyas, Y.; Cocuzza, S. Zero Reaction Torque Trajectory Tracking of an Aerial Manipulator through Extended Generalized Jacobian. Appl. Sci. 2022, 12, 12254](https://doi.org/10.3390/app122312254)
+For more info check the paper (please consider citing):
 
 - [Pedrocco, M.; Pasetto, A.; Fanti, G.; Benato, A.; Cocuzza, S. Trajectory Tracking Control of an Aerial Manipulator in the Presence of Disturbances and Model Uncertainties. Appl. Sci. 2024, 14, 2512](https://doi.org/10.3390/app14062512)

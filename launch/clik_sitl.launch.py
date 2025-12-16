@@ -134,7 +134,8 @@ def generate_launch_description():
 
     microxrce_agent = TimerAction(
         period=10.0,
-        actions=[microxrce_agent_proc]
+        actions=[microxrce_agent_proc],
+        condition=UnlessCondition(use_gz_odom)
     )
 
     # Pubblica la configurazione di sleep via CLI (una volta sola)
@@ -187,7 +188,8 @@ def generate_launch_description():
                     real_drone_vel_pub,
                 ])
             ]
-        )
+        ),
+        condition=UnlessCondition(use_gz_odom)
     )
 
     # Nodo CLIK in SITL: usa posa da Gazebo e pubblica comandi verso ros2_control

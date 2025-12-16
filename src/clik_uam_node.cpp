@@ -152,8 +152,8 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
     error_vel_ee_.resize(6);
     arm_joints_ = {"waist", "shoulder", "elbow", "forearm_roll", "wrist_angle", "wrist_rotate"};
 
-    declare_parameter("k_err_pos_", 20.0);
-    declare_parameter("k_err_vel_", 0.0);
+    declare_parameter("k_err_pos_", 60.0);
+    declare_parameter("k_err_vel_", 60.0);
     this->declare_parameter<double>("joint_vel_limit", 3.14);
     k_err_pos_ = get_parameter("k_err_pos_").as_double();
     k_err_vel_ = get_parameter("k_err_vel_").as_double();
@@ -183,6 +183,10 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
     // Opzione per sfruttare ridondanza cinematica: segui solo la traiettoria di posizione (ignora orientazione)
     this->declare_parameter<bool>("redundant", false);
     redundant_ = this->get_parameter("redundant").as_bool();
+
+    // In modalità redundant, scala il feedback sull'orientazione EE (0 = nullo, 1 = pieno)
+    this->declare_parameter<double>("redundant_ang_fb_scale", 0.05);
+    redundant_ang_fb_scale_ = this->get_parameter("redundant_ang_fb_scale").as_double();
 
     // Timer di update() controllo parametrico
     this->declare_parameter<double>("control_rate_hz", 100.0);
@@ -759,15 +763,15 @@ void ClikUamNode::update()
     // Risolvo sistema
     Eigen::VectorXd qdd_total;
     if (redundant_) {
-        // Mantieni la dinamica z1 completa (6 righe) e usa solo 3 righe di J (posizione)
-        // Matrice aumentata rettangolare: [Ag_b Ag_m; J_b(3) J_m(3)] -> 9 x (6+m_total)
-        Eigen::MatrixXd Aug_red(9, 6 + m_total);
-        Aug_red << Ag_b_, Ag_m_,
-                   J_b.topRows(3),   J_m.topRows(3);
+        // Mantieni la dinamica z1 completa (6 righe) e includi anche le 6 righe di J.
+        // Il feedback sulla parte angolare dell'EE viene attenuato tramite redundant_ang_fb_scale_.
 
-        // RHS: prima 6 componenti di z1 (dinamica completa), poi 3 componenti di z2 (solo posizione)
-        Eigen::VectorXd rhs_ff_red(9); rhs_ff_red << z1, z2_ff.head(3);
-        Eigen::VectorXd rhs_fb_red(9); rhs_fb_red << Eigen::VectorXd::Zero(6), z2_fb.head(3);
+        // Scala solo il contributo di feedback angolare (ultime 3 componenti di z2_fb)
+        Eigen::VectorXd z2_fb_redundant = z2_fb;
+        z2_fb_redundant.tail(3) *= redundant_ang_fb_scale_;
+
+        Eigen::VectorXd rhs_ff_red(12); rhs_ff_red << z1, z2_ff;
+        Eigen::VectorXd rhs_fb_red(12); rhs_fb_red << Eigen::VectorXd::Zero(6), z2_fb_redundant;
         Eigen::VectorXd rhs_total_red = rhs_ff_red + rhs_fb_red;
 
         // Pseudoinversa pesata come in clik1: Pinv = Wc_inv * A^T * (A * Wc_inv * A^T)^{-1}
@@ -781,12 +785,12 @@ void ClikUamNode::update()
         Eigen::MatrixXd Wc_inv = Eigen::MatrixXd::Identity(6 + m_total, 6 + m_total);
         Wc_inv.block(6, 6, m_total, m_total) = W_inv_vec.asDiagonal();
 
-        Eigen::MatrixXd A = Aug_red;
+        Eigen::MatrixXd A = Aug;
         Eigen::MatrixXd AwAt = A * Wc_inv * A.transpose();          
         const double damping = 1e-6;
         Eigen::MatrixXd AwAt_reg = AwAt + damping * Eigen::MatrixXd::Identity(AwAt.rows(), AwAt.cols());
         Eigen::MatrixXd AwAt_inv = AwAt_reg.ldlt().solve(Eigen::MatrixXd::Identity(AwAt.rows(), AwAt.cols()));
-        Eigen::MatrixXd Pinv = Wc_inv * A.transpose() * AwAt_inv;    // (6+m_total) x 9
+        Eigen::MatrixXd Pinv = Wc_inv * A.transpose() * AwAt_inv;    // (6+m_total) x 12
 
         Eigen::VectorXd acc_total = Pinv * rhs_total_red;
         qdd_total = acc_total.tail(m_total);
