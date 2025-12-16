@@ -133,22 +133,22 @@ ros2 run clik2_node_pkg planner
 
 The algorithm computes in real-time the reference accelerations that manipulators motors must have in order to track the desired trajectory. This is done through:
 
-$$ \left\{ \begin{array}{cc} \ddot{\mathbf{q}}_b \\ \ddot{\mathbf{q}}_m \end{array} \right\} = \left[
-\begin{array}{cc}
-[\mathbf{A}_{b}] & [\mathbf{A}_{m}] \\
-[\mathbf{J}_{b}] & [\mathbf{J}_{m}]
-\end{array} \right]^\dagger
-\left\{ \begin{array}{cc} \mathbf{z}_1 \\ \mathbf{z}_2 \end{array} \right\}
-$$
-
+$`  \left\{ \begin{array}{c} \ddot{\mathbf{q}}_b \\ \ddot{\mathbf{q}}_m \end{array} \right\} =
+\begin{bmatrix}
+[\mathbf{A}_b]&[\mathbf{A}_m] \\
+[\mathbf{J}_{b}]&[\mathbf{J}_{m}]
+\end{bmatrix}^{\dagger}
+\left\{ \begin{array}{c} \mathbf{z}_1 \\ \mathbf{z}_2 \end{array} \right\}
+`$
+  
 where:
 
-- $[\mathbf{A}_{b}] , [\mathbf{A}_{m}]$ are the **Centroidal Momentum Matrices** relative to the base and the manipulator respectively.
-- $[\mathbf{J}_{b}] , [\mathbf{J}_{m}]$ are the **Jacobian Matrices** mapping base and joints generalized velocities to end-effector twist.
-- $\mathbf{z}_1 = -[\dot{\mathbf{A}}]\dot{\mathbf{q}}$
-- $\mathbf{z}_2 = \mathbf{a}_{\text{e,des}} - [\dot{\mathbf{J}}]\dot{\mathbf{q}} + [\mathbf{K}_P]\mathbf{e} + [\mathbf{K}_D]\dot{\mathbf{e}}$
-- $[\mathbf{K}_P]$ is the proportional gain matrix. $[\mathbf{K}_D]$ is the derivative gain matrix.
-- $\mathbf{e}$ is EE pose error vector. $\dot{\mathbf{e}}$ is the EE velocity error.
+- $`[\mathbf{A}_{b}] , [\mathbf{A}_{m}]`$ are the **Centroidal Momentum Matrices** relative to the base and the manipulator respectively.
+- $`[\mathbf{J}_{b}] , [\mathbf{J}_{m}]`$ are the **Jacobian Matrices** mapping base and joints generalized velocities to end-effector twist.
+- $`\mathbf{z}_1 = -[\dot{\mathbf{A}} ]\dot{\mathbf{q}}`$
+- $`\mathbf{z}_2 = \mathbf{a}_{\text{e,des}} - [\dot{\mathbf{J}}]\dot{\mathbf{q}} + [\mathbf{K}_P]\mathbf{e} + [\mathbf{K}_D]\dot{\mathbf{e}}`$
+- $`[\mathbf{K}_P]`$ is the proportional gain matrix. $`[\mathbf{K}_D]`$ is the derivative gain matrix.
+- $`\mathbf{e}`$ is EE pose error vector. $`\dot{\mathbf{e}}`$ is the EE velocity error.
 
 For more info check the paper (please consider citing):
 
