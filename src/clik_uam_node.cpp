@@ -32,6 +32,8 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
 
     this->declare_parameter<bool>("use_gazebo_pose", true);
     this->get_parameter("use_gazebo_pose", use_gazebo_pose_);
+    this->declare_parameter<bool>("use_gz_odom", true);
+    use_gz_odom_ = this->get_parameter("use_gz_odom").as_bool();
 
     // Parametri per instradare i topic e la modalità reale/simulata
     this->declare_parameter<std::string>("robot_name", "mobile_wx250s");
@@ -75,26 +77,28 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
             "/t960a/pose", 10, std::bind(&ClikUamNode::real_drone_pose_callback, this, std::placeholders::_1));
     }
 
-    // Sottoscrizione alla velocità/odometria del drone
-    // - Se uso la posa da Gazebo, sottoscrivo all'odometria del modello Gazebo
-    // - Mi iscrivo a /real_t960a_twist se NON uso la posa Gazebo
-    //   oppure se il sistema è reale (real_system_ == true)
-    if (use_gazebo_pose_)
-    {
-        // Simulazione: usa l'odometria del modello gazebo bridgiata su ROS2
-        gazebo_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/model/t960a_0/odometry", 10,
-            std::bind(&ClikUamNode::gazebo_odometry_callback, this, std::placeholders::_1));
-        RCLCPP_INFO(this->get_logger(), "use_gazebo_pose=true -> uso /model/t960a_0/odometry (nav_msgs/Odometry) per il twist del drone");
-    }
+    // Sottoscrizione alla velocità/odometria del drone. Regole:
+    // - Se use_gz_odom == false: usa /real_t960a_twist (da real_drone_vel_pub) e NON iscriversi a /model/t960a_0/odometry
+    // - Se use_gz_odom == true e use_gazebo_pose_ == true: usa /model/t960a_0/odometry
+    // - Se real_system_ == true: comunque iscriviti a /real_t960a_twist
 
-    if (!use_gazebo_pose_ || real_system_)
+    if (!use_gz_odom_ || real_system_ || !use_gazebo_pose_)
     {
         // Twist già trasformato in FLU (da real_drone_vel_pub, quando disponibile)
         real_drone_twist_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
             "/real_t960a_twist", rclcpp::SensorDataQoS(),
             std::bind(&ClikUamNode::real_drone_twist_callback, this, std::placeholders::_1));
-        RCLCPP_INFO(this->get_logger(), "!use_gazebo_pose_ || real_system_ -> mi iscrivo a /real_t960a_twist (Twist FLU) per il twist del drone");
+        RCLCPP_INFO(this->get_logger(), "Iscrizione a /real_t960a_twist (Twist FLU) [use_gz_odom=%d, real_system=%d, use_gazebo_pose=%d]",
+                    use_gz_odom_, real_system_, use_gazebo_pose_);
+    }
+
+    if (use_gz_odom_ && use_gazebo_pose_)
+    {
+        // Simulazione: usa l'odometria del modello gazebo bridgiata su ROS2
+        gazebo_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            "/model/t960a_0/odometry", 10,
+            std::bind(&ClikUamNode::gazebo_odometry_callback, this, std::placeholders::_1));
+        RCLCPP_INFO(this->get_logger(), "Iscrizione a /model/t960a_0/odometry (nav_msgs/Odometry) [use_gz_odom=false, use_gazebo_pose=true]");
     }
 
     // Joint states
@@ -518,32 +522,32 @@ void ClikUamNode::update()
     for (int k = 6; k < model_.nv; ++k) v_gen_meas[k] = qd_[k];
 
     // Debug: stampa le componenti di v_gen_meas ([lin; ang] base in LOCAL e giunti)
-    {
-        std::ostringstream oss;
-        oss.setf(std::ios::fixed);
-        oss.precision(4);
-        oss << "v_gen_meas: base_local=["
-            << v_gen_meas[0] << ", " << v_gen_meas[1] << ", " << v_gen_meas[2] << " | "
-            << v_gen_meas[3] << ", " << v_gen_meas[4] << ", " << v_gen_meas[5] << "], joints=["
-            << v_gen_meas.tail(model_.nv - 6).transpose() << "]";
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200, "%s", oss.str().c_str());
+    // {
+    //     std::ostringstream oss;
+    //     oss.setf(std::ios::fixed);
+    //     oss.precision(4);
+    //     oss << "v_gen_meas: base_local=["
+    //         << v_gen_meas[0] << ", " << v_gen_meas[1] << ", " << v_gen_meas[2] << " | "
+    //         << v_gen_meas[3] << ", " << v_gen_meas[4] << ", " << v_gen_meas[5] << "], joints=["
+    //         << v_gen_meas.tail(model_.nv - 6).transpose() << "]";
+    //     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200, "%s", oss.str().c_str());
         
-        bool has_nan_base = false;
-        for (int i = 0; i < 6; ++i) {
-            if (!std::isfinite(v_gen_meas[i])) { has_nan_base = true; break; }
-        }
-        if (has_nan_base) {
-            RCLCPP_WARN(this->get_logger(), "v_gen_meas contiene NaN/Inf nelle componenti base [0:5]");
-        }
+    //     bool has_nan_base = false;
+    //     for (int i = 0; i < 6; ++i) {
+    //         if (!std::isfinite(v_gen_meas[i])) { has_nan_base = true; break; }
+    //     }
+    //     if (has_nan_base) {
+    //         RCLCPP_WARN(this->get_logger(), "v_gen_meas contiene NaN/Inf nelle componenti base [0:5]");
+    //     }
         
-        bool has_nan_joints = false;
-        for (int i = 6; i < model_.nv; ++i) {
-            if (!std::isfinite(v_gen_meas[i])) { has_nan_joints = true; break; }
-        }
-        if (has_nan_joints) {
-            RCLCPP_WARN(this->get_logger(), "v_gen_meas contiene NaN/Inf nelle componenti giunti [6:nv]");
-        }
-    }
+    //     bool has_nan_joints = false;
+    //     for (int i = 6; i < model_.nv; ++i) {
+    //         if (!std::isfinite(v_gen_meas[i])) { has_nan_joints = true; break; }
+    //     }
+    //     if (has_nan_joints) {
+    //         RCLCPP_WARN(this->get_logger(), "v_gen_meas contiene NaN/Inf nelle componenti giunti [6:nv]");
+    //     }
+    // }
 
     // 2. CINEMATICA DIRETTA PER POSA GLOBALE CORRENTE EE
 

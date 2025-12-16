@@ -70,6 +70,7 @@ private:
     bool has_gazebo_odom_ = false;
     bool has_real_drone_twist_ = false;
     bool use_gazebo_pose_;
+    bool use_gz_odom_ = true;
 
     rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr gazebo_pose_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr desired_ee_global_pose_sub_;

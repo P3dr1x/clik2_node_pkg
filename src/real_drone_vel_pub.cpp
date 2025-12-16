@@ -1,8 +1,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
-#include <px4_msgs/msg/vehicle_local_position.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <cmath>
 
 // Nodo: real_drone_vel_pub
@@ -10,8 +10,8 @@
 //  - velocità lineare nel frame WORLD-FLU fissato alla direzione di marcia iniziale
 //  - velocità angolare nel frame body FLU
 // Usa:
-//  - /fmu/out/vehicle_local_position per ricavare lo yaw iniziale (heading)
-//  - /fmu/out/vehicle_odometry per velocità lineare (NED) e angolare (body FRD)
+//  - /fmu/out/vehicle_odometry per ricavare yaw iniziale (dal quaternione),
+//    velocità lineare (NED) e angolare (body FRD)
 
 class RealDroneVelPub : public rclcpp::Node {
 public:
@@ -21,42 +21,38 @@ public:
 
     twist_pub_ = create_publisher<geometry_msgs::msg::Twist>("/real_t960a_twist", 10);
 
-    vehicle_local_position_sub_ = create_subscription<px4_msgs::msg::VehicleLocalPosition>( 
-        "/fmu/out/vehicle_local_position", rclcpp::SensorDataQoS(),
-        std::bind(&RealDroneVelPub::vehicle_local_position_cb, this, _1));
-
     vehicle_odom_sub_ = create_subscription<px4_msgs::msg::VehicleOdometry>(
         "/fmu/out/vehicle_odometry", rclcpp::SensorDataQoS(),
         std::bind(&RealDroneVelPub::vehicle_odom_cb, this, _1));
   }
 
 private:
-  void vehicle_local_position_cb(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg) {
-    vehicle_local_position_ = *msg;
-    has_position_ = true;
-
-    // Inizializza una sola volta lo yaw di riferimento (heading iniziale)
-    if (!yaw_offset_initialized_) {
-      yaw_offset_ = vehicle_local_position_.heading; // [rad]
-      yaw_offset_initialized_ = true;
-      RCLCPP_INFO(get_logger(), "Yaw iniziale (heading) catturato: %.3f rad", yaw_offset_);
-    }
-
-    try_publish();
-  }
-
   void vehicle_odom_cb(const px4_msgs::msg::VehicleOdometry::SharedPtr msg) {
     vehicle_odom_ = *msg;
     has_odom_ = true;
+
+    // Inizializza una sola volta lo yaw di riferimento dal quaternione di odometry
+    if (!yaw_offset_initialized_) {
+      // PX4 VehicleOdometry.q è NED->FRD (w,x,y,z)
+      Eigen::Quaterniond q_px4(vehicle_odom_.q[0], vehicle_odom_.q[1], vehicle_odom_.q[2], vehicle_odom_.q[3]);
+      // Converti FRD -> FLU: (w, x, -y, -z)
+      Eigen::Quaterniond q_flu(q_px4.w(), q_px4.x(), -q_px4.y(), -q_px4.z());
+      q_flu.normalize();
+      // Estrai yaw dal quaternione FLU
+      Eigen::Vector3d eul = q_flu.toRotationMatrix().eulerAngles(2,1,0); // yaw, pitch, roll
+      yaw_offset_ = eul[0];
+      yaw_offset_initialized_ = true;
+      RCLCPP_INFO(get_logger(), "Yaw iniziale (odometry) catturato: %.3f rad", yaw_offset_);
+    }
     try_publish();
   }
 
   void try_publish() {
-    if (!(has_position_ && has_odom_ && yaw_offset_initialized_)) {
+    if (!(has_odom_ && yaw_offset_initialized_)) {
       return;
     }
 
-    // Velocità lineare: campo velocity in NED [vx, vy, vz] = [N, E, D]
+    // Velocità lineare: campo velocity in NED [N, E, D]
     const double x_n = static_cast<double>(vehicle_odom_.velocity[0]);
     const double y_e = static_cast<double>(vehicle_odom_.velocity[1]);
     const double z_d = static_cast<double>(vehicle_odom_.velocity[2]);
@@ -89,12 +85,9 @@ private:
   }
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
-  rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr vehicle_local_position_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr vehicle_odom_sub_;
 
-  px4_msgs::msg::VehicleLocalPosition vehicle_local_position_;
   px4_msgs::msg::VehicleOdometry vehicle_odom_;
-  bool has_position_{false};
   bool has_odom_{false};
   bool yaw_offset_initialized_{false};
   double yaw_offset_{0.0};
