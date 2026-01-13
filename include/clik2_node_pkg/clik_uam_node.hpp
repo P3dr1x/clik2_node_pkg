@@ -20,6 +20,9 @@
 #include "geometry_msgs/msg/transform_stamped.hpp" 
 #include "pinocchio/multibody/model.hpp"
 #include "pinocchio/multibody/data.hpp"
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
+#include <OsqpEigen/OsqpEigen.h>
 #include <unordered_map>
 
 class ClikUamNode : public rclcpp::Node
@@ -87,6 +90,23 @@ private:
     pinocchio::Data::Matrix6x J_;
     pinocchio::FrameIndex ee_frame_id_;
 
+    // Pinocchio model for the manipulator only (FreeFlyer + arm) used for reaction-moment minimization
+    pinocchio::Model model_man_;
+    pinocchio::Data data_man_;
+    std::vector<int> idx_v_arm_man_;
+    std::vector<int> idx_q_arm_man_;
+
+    // Precomputed indices for arm joints in the full model
+    std::vector<int> idx_v_arm_;
+    std::vector<int> idx_q_arm_;
+
+    // Joint limits (arm_joints_ order)
+    Eigen::VectorXd q_lower_arm_;
+    Eigen::VectorXd q_upper_arm_;
+    Eigen::VectorXd v_limit_arm_;
+    bool have_position_limits_ = false;
+    bool have_velocity_limits_ = false;
+
     // Sottomatrici della Centroidal Momentum Matrix (Ag)
     Eigen::MatrixXd Ag_b_; // 6x6
     Eigen::MatrixXd Ag_m_; // 6xm (m = nv - 6)
@@ -102,6 +122,12 @@ private:
     double k_err_vel_;
     // Limite di velocità giunti (rad/s)
     double joint_vel_limit_ = 3.14;
+
+    // Trade-off tracking vs reaction-moment minimization (lambda_W = W_kin/W_dyn)
+    double lambda_w_ = 10.0;
+
+    // QP regularization
+    double qp_lambda_reg_ = 1e-6;
 
     // Flag e timestamp per gestione messaggi desiderati
     bool desired_ee_accel_ready_ = false;
@@ -161,6 +187,29 @@ private:
 
     // Contatore delle iterazioni dell'update dopo il superamento della guardia
     std::size_t update_iterations_after_guard_ = 0;
+
+    // === QP (OSQP-Eigen) state for acceleration-level control ===
+    OsqpEigen::Solver qp_solver_;
+    bool qp_initialized_ = false;
+    int qp_n_ = 0; // number of variables (arm joints)
+
+    Eigen::SparseMatrix<double> qp_hessian_;
+    Eigen::SparseMatrix<double> qp_A_;
+    Eigen::VectorXd qp_gradient_;
+    Eigen::VectorXd qp_l_;
+    Eigen::VectorXd qp_u_;
+    Eigen::VectorXd qp_solution_;
+
+    // Dense work buffers
+    Eigen::MatrixXd qp_P_dense_;
+    Eigen::MatrixXd qp_J_task_;   // 6 x n
+    Eigen::VectorXd qp_v_task_;   // 6
+    Eigen::MatrixXd qp_H_mr_;     // 3 x n
+    Eigen::VectorXd qp_n_mr_;     // 3
+
+    // State buffers for manipulator-only dynamics
+    Eigen::VectorXd q_man_;
+    Eigen::VectorXd v_man_;
 };
 
 #endif // CLIK2_NODE_PKG_CLIK_UAM_NODE_HPP_

@@ -12,7 +12,7 @@ $$
 
 where:
 
-* `Jgen` is the **generalized Jacobian** mapping joint accelerations to EE acceleration (task space reduced as needed),
+* $J_{gen} = J_m - J_b H_b^{-1} H_m$ is the **generalized Jacobian** mapping joint accelerations to EE acceleration (task space reduced as needed), $H_b, H_m$ are submatrices of the inertia matrix of the entire aerial manipulator relative to the base and the manipulator respectively.
 * `vd_des` is the desired task-space acceleration with feedback terms,
 * `H_MR` is the **reaction-moment inertia submatrix** (rows 3–6) of the **manipulator-only inertia matrix**,
 * `n` is the corresponding nonlinear term (Coriolis + centrifugal + gravity contribution, consistent with `H_MR`),
@@ -63,7 +63,7 @@ The control algorithm is similar to that presented in the paper in `media/paper-
    * `H_MR = H_m.block(3, 0, 3, nq)`
    * `n_mr     = n_m.segment(3, 3)`
 
-6. Assemble and solve QP for `qdd`
+6. Assemble and solve QP for `qdd`. Implement both velocity and position joint limits. Regarding position joint limits implement the constraints as how you think it's better.
 
 7. Integrate/forward `qdd` to low-level joint controller
 
