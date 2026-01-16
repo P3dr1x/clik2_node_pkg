@@ -89,6 +89,7 @@ private:
     pinocchio::Data data_;
     pinocchio::Data::Matrix6x J_;
     pinocchio::FrameIndex ee_frame_id_;
+    pinocchio::FrameIndex arm_base_frame_id_full_;
 
     // Pinocchio model for the manipulator only (FreeFlyer + arm) used for reaction-moment minimization
     pinocchio::Model model_man_;
@@ -206,6 +207,10 @@ private:
     Eigen::VectorXd qp_v_task_;   // 6
     Eigen::MatrixXd qp_H_mr_;     // 3 x n
     Eigen::VectorXd qp_n_mr_;     // 3
+
+    // Buffer per Jacobiano generalizzato (stima di Jgen_dot via differenze finite)
+    Eigen::MatrixXd Jgen_prev_;   // 6 x n_arm
+    bool have_Jgen_prev_ = false;
 
     // State buffers for manipulator-only dynamics
     Eigen::VectorXd q_man_;

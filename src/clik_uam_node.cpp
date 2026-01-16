@@ -68,6 +68,14 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
     ee_frame_id_ = model_.getFrameId("mobile_wx250s/ee_gripper_link");
     RCLCPP_INFO(this->get_logger(), "End-effector frame ID: %d", static_cast<int>(ee_frame_id_));
 
+    // Frame base braccio (punto di connessione O) - serve per impostare lo stato del manipolatore-only
+    if (!model_.existFrame("mobile_wx250s/base_link")) {
+        RCLCPP_ERROR(this->get_logger(), "Frame 'mobile_wx250s/base_link' assente nel modello.");
+        rclcpp::shutdown();
+        return;
+    }
+    arm_base_frame_id_full_ = model_.getFrameId("mobile_wx250s/base_link");
+
     // Giunti controllati (gruppo "arm"). Definiti prima di precomputare gli indici.
     arm_joints_ = {"waist", "shoulder", "elbow", "forearm_roll", "wrist_angle", "wrist_rotate"};
 
@@ -628,7 +636,7 @@ void ClikUamNode::update()
         );
     }
 
-    // --- VERIFICARE: Stima velocità generalizzata v (Pinocchio richiede LOCAL per la base free-flyer) ---
+    // --- Stima velocità generalizzata v (Pinocchio richiede LOCAL per la base free-flyer) ---
     // Converti WORLD -> LOCAL usando R^T per la parte lineare.
     // La parte angolare, nel caso reale, arriva già in body FLU da real_drone_vel_pub.
     Eigen::Quaterniond q_world_base(vehicle_attitude_.q[0], vehicle_attitude_.q[1], vehicle_attitude_.q[2], vehicle_attitude_.q[3]);
@@ -721,6 +729,34 @@ void ClikUamNode::update()
     // Jacobiano del frame in LOCAL_WORLD_ALIGNED (coerente con v_gen_meas: base in LOCAL)
     pinocchio::computeFrameJacobian(model_, data_, q_, ee_frame_id_, pinocchio::ReferenceFrame::LOCAL_WORLD_ALIGNED, J_);
 
+    // === Jacobiano generalizzato Jgen ===
+    // Jgen = Jm - Jb * Ab^{-1} * Am
+    // dove Ab e Am sono estratti dalla matrice centroidale d'inerzia (CMM) Ag del modello completo.
+    // Ag mappa v_gen (base in LOCAL, giunti) nel momento centroidale (6D).
+    pinocchio::computeCentroidalMap(model_, data_, q_);
+    const Eigen::Matrix<double, 6, 6> Ab = data_.Ag.leftCols<6>();
+    Eigen::MatrixXd Am_arm(6, n_arm);
+    for (int i = 0; i < n_arm; ++i) {
+        Am_arm.col(i) = data_.Ag.col(idx_v_arm_[i]);
+    }
+
+    Eigen::MatrixXd Ab_inv_Am(6, n_arm);
+    {
+        Eigen::LDLT<Eigen::Matrix<double, 6, 6>> ldlt(Ab);
+        if (ldlt.info() == Eigen::Success) {
+            Ab_inv_Am = ldlt.solve(Am_arm);
+        } else {
+            Ab_inv_Am = Ab.completeOrthogonalDecomposition().solve(Am_arm);
+        }
+    }
+
+    const Eigen::Matrix<double, 6, 6> Jb = J_.leftCols<6>();
+    Eigen::MatrixXd Jm_arm(6, n_arm);
+    for (int i = 0; i < n_arm; ++i) {
+        Jm_arm.col(i) = J_.col(idx_v_arm_[i]);
+    }
+    const Eigen::MatrixXd Jgen = Jm_arm - (Jb * Ab_inv_Am);
+
     const Eigen::Index m_total = static_cast<Eigen::Index>(model_.nv) - 6; // DoF manipolatore = nv - 6
     const Eigen::Index m_arm = static_cast<Eigen::Index>(arm_joints_.size());
 
@@ -747,7 +783,9 @@ void ClikUamNode::update()
 
     // 5. CALCOLO ERRORE POSE END-EFFECTOR
 
-    // Costruisci SE3 desiderata in WORLD
+    // Errore posa come in clik1_node_pkg:
+    // - posizione: e_pos = p_des - p_cur (WORLD)
+    // - orientazione: e_ang = log3(R_des * R_cur^T) (WORLD)
     Eigen::Quaterniond ee_des_quat(
         desired_ee_pose_world_.orientation.w,
         desired_ee_pose_world_.orientation.x,
@@ -762,19 +800,15 @@ void ClikUamNode::update()
         desired_ee_pose_world_.position.z
     );
 
-    pinocchio::SE3 T_des(R_des, p_des);
+    const Eigen::Vector3d p_cur = ee_placement.translation();
+    const Eigen::Vector3d e_pos = p_des - p_cur; // world
 
-    // Errore di posa SE3 in WORLD: T_err = T_des * T_cur^{-1}
-    //pinocchio::SE3 T_err = T_des * ee_placement.inverse();
-    pinocchio::SE3 T_err = ee_placement.inverse()* T_des;
+    const Eigen::Matrix3d R_cur = ee_placement.rotation();
+    const Eigen::Matrix3d R_err_world = R_des * R_cur.transpose();
+    const Eigen::Vector3d e_ang = pinocchio::log3(R_err_world); // world
 
-    // Logaritmo su SE(3) restituisce un twist nel frame locale del termine di errore.
-    // Convertiamolo al frame WORLD usando l'Adjoint della posa corrente dell'EE.
-    const Eigen::Matrix<double,6,1> err_body_al = pinocchio::log6(T_err).toVector(); 
-    const Eigen::Matrix<double,6,6> Ad_world_from_cur = ee_placement.toActionMatrix();
-    const Eigen::Matrix<double,6,1> err_world_al = Ad_world_from_cur * err_body_al; 
-    error_pose_ee_.head<3>() = err_world_al.head<3>(); // lin in WORLD
-    error_pose_ee_.tail<3>() = err_world_al.tail<3>(); // ang in WORLD
+    error_pose_ee_.head<3>() = e_pos;
+    error_pose_ee_.tail<3>() = e_ang;
 
     // 6. CALCOLO ERRORE DI VELOCITÀ END-EFFECTOR
 
@@ -787,38 +821,64 @@ void ClikUamNode::update()
     error_vel_ee_ = v_ee_des - v_ee_meas;
 
 
-    // 7. CALCOLO vdot_des (task accel) secondo istruzioni: vdot_des = xdd_ref + Kp*e + Kd*e_dot - Jdot*v
-    pinocchio::computeJointJacobiansTimeVariation(model_, data_, q_, v_gen_meas);
-    Eigen::Matrix<double, 6, Eigen::Dynamic> Jdot(6, model_.nv);
-    pinocchio::getFrameJacobianTimeVariation(model_, data_, ee_frame_id_, pinocchio::ReferenceFrame::LOCAL_WORLD_ALIGNED, Jdot);
-    const Eigen::VectorXd Jdot_v = Jdot * v_gen_meas;
+    // 7. CALCOLO vdot_des (task accel) secondo istruzioni: vdot_des = xdd_ref + Kp*e + Kd*e_dot - Jgen_dot * qd_arm
+    // Jgen_dot viene stimato via differenze finite tra cicli (robusto e indipendente dalla derivata di Hb/Hm).
+    Eigen::Matrix<double, 6, 1> Jgen_dot_qd = Eigen::Matrix<double, 6, 1>::Zero();
+    if (!have_Jgen_prev_) {
+        Jgen_prev_ = Jgen;
+        have_Jgen_prev_ = true;
+    } else {
+        if (dt > 0.0) {
+            const Eigen::MatrixXd Jgen_dot = (Jgen - Jgen_prev_) / dt;
+            Jgen_dot_qd.noalias() = Jgen_dot * qd_arm_meas;
+        }
+        Jgen_prev_ = Jgen;
+    }
 
     Eigen::VectorXd fb = K_matrix_ * error_pose_ee_ + Kd_matrix_ * error_vel_ee_;
     if (redundant_) {
         fb.tail(3) *= redundant_ang_fb_scale_;
     }
 
-    Eigen::VectorXd vdot_des = acc_ee_des + fb - Jdot_v;
+    Eigen::VectorXd vdot_des = acc_ee_des + fb - Jgen_dot_qd;
 
     // 8. COSTRUZIONE QP: min 0.5*lambda_w||J*qdd - vdot_des||^2 + 0.5||H_MR*qdd + n_mr||^2
     qp_v_task_ = vdot_des;
     for (int i = 0; i < n_arm; ++i) {
-        qp_J_task_.col(i) = J_.col(idx_v_arm_[i]);
+        qp_J_task_.col(i) = Jgen.col(i);
     }
 
-    // Dinamica manipolatore-only per H_MR e n_mr (righe 3..5: momento base in frame body/LOCAL)
+    // Dinamica manipolatore-only per H_MR e n_mr (righe 3..5: momento base in frame LOCAL della base del braccio)
+    // NOTA: la base del manipolatore-only corrisponde a mobile_wx250s/base_link (non al link base del drone).
     q_man_.setZero();
     v_man_.setZero();
-    // base pose (free-flyer)
-    q_man_.segment<7>(0) = q_.segment<7>(0);
-    // joint positions/velocities (arm only)
+
+    // Posa di O (mobile_wx250s/base_link) nel mondo dal modello completo
+    const pinocchio::SE3 &T_w_O = data_.oMf[arm_base_frame_id_full_];
+    q_man_.segment<3>(0) = T_w_O.translation();
+    Eigen::Quaterniond q_O(T_w_O.rotation());
+    q_O.normalize();
+    q_man_[3] = q_O.x();
+    q_man_[4] = q_O.y();
+    q_man_[5] = q_O.z();
+    q_man_[6] = q_O.w();
+
+    // Copia posizioni giunti braccio (ordine arm_joints_)
     for (int i = 0; i < n_arm; ++i) {
         q_man_[idx_q_arm_man_[i]] = q_arm_meas[i];
-        v_man_[idx_v_arm_man_[i]] = qd_arm_meas[i];
     }
-    // base twist in LOCAL
-    v_man_.segment<3>(0) = vlin_base_local;
-    v_man_.segment<3>(3) = omega_base_local;
+
+    // Velocità base del braccio nel frame LOCAL (coerente con JointModelFreeFlyer)
+    const pinocchio::Motion V_O_local = pinocchio::getFrameVelocity(
+        model_, data_, arm_base_frame_id_full_, pinocchio::ReferenceFrame::LOCAL);
+    v_man_.segment<3>(0) = V_O_local.linear();
+    v_man_.segment<3>(3) = V_O_local.angular();
+
+    // Copia velocità giunti braccio
+    for (int i = 0; i < n_arm; ++i) {
+        v_man_[idx_v_arm_man_[i]] = v_gen_meas[idx_v_arm_[i]];
+    }
+
     pinocchio::normalize(model_man_, q_man_);
 
     pinocchio::crba(model_man_, data_man_, q_man_);
@@ -934,17 +994,6 @@ void ClikUamNode::update()
 
     // Integrazione secondo metodo di Eulero implicito con accelerazione totale
     qd_int_       += qdd_total * dt;
-
-    // Sanifica e satura le velocità giunto rispetto al limite configurato
-    auto sanitize_and_clamp_vel = [&](Eigen::VectorXd &v) {
-        for (Eigen::Index i = 0; i < v.size(); ++i) {
-            double &x = v[i];
-            if (!std::isfinite(x)) x = 0.0;
-            if (x > joint_vel_limit_) x = joint_vel_limit_;
-            else if (x < -joint_vel_limit_) x = -joint_vel_limit_;
-        }
-    };
-    sanitize_and_clamp_vel(qd_int_);
 
     // Aggiorna posizioni integrate
     q_pos_int_   += qd_int_ * dt;
