@@ -52,7 +52,7 @@ Also here you can use the `real_system:=true` option.
 In order to plan the cartesian trajectory, in another terminal run
 
 ```bash 
-ros2 run clik_node_pkg planner 
+ros2 run clik2_node_pkg planner 
 ```
 Now the user will be asked to choose which action to perform with the end-effector (for now only positioning and circu;ar trakjectory tracking can be ordered).
 1. If `Positioning` is chosen, user will be asked to type the desired EE pose w.r.t. the current pose of the manipulator base. The user has to type 7 numbers (desired position + quaternion). 
@@ -63,7 +63,7 @@ If no or invalid input is given by the user, the desired relative EE pose comman
 For running the controller 
 
 ```bash
-ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=60.0 -p k_err_vel_:=60.0
+ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=50.0 -p k_err_vel_:=50.0 -p control_rate_hz:=100.0 -p redundant:=false -p lambda_w:=1.0 -p redundant_ang_fb_scale_:=1.0
 ```
 
 
@@ -79,13 +79,14 @@ ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=60.0 -p k_err_ve
 Parameter      |Default value |   Description    |
 |-------------------|---------------|------------|
 | `use_gazebo_pose` | `true` | The node will try to subscribe to the `/world/default/dynamic_pose/info` topic bridged from Gazebo to ROS2 for getting the UAV pose. 
-| `k_err_pos_` | `60.0` | Is the proportional gain value for the EE feedback
-| `k_err_vel_` | `60.0` | Is the derivative gain value for the EE feedback  
+| `k_err_pos_` | `20.0` | Is the proportional gain value for the EE feedback
+| `k_err_vel_` | `20.0` | Is the derivative gain value for the EE feedback  
 | `real_system` | `false` | In some nodes is this parameter that decides if to subscribe to the `/real_t960a_pose` topic
 | `use_gz_odom` | `true` | If `false` the node will try to subscribe to `/real_t960a_twist` to get the UAV twist. Make sure that also the launch file was launched with `use_gz_odom=false` in that case
 | `redundant` | `false` | Choose wether you want to command both position and orientation to the EE or only the position (in that case set `true`). **At the moment it does not work as intended**
 | `control_rate_hz` | `100.0` | Frequency at which the `update()` loop of the controller node will operate.
 | `<joint_name>_weight` | `15.0`, `25.0` | Set the weight of the specific joint. This influences the weight matrix used in the weighted pseudoinversion. You can choose `shoulder`, `forearm_roll`, `wrist_rotate` joints.
+|`lambda_w` | `10.0` | Sets if to give priority to trajectory tracking or to reaction torque minimization. If `lambda_w>1.0` you give more priority to trajectory tracking while if `0.0<lambda_w<1.0`.
 
 
 ## Usage with real system (Motion Capture)
@@ -120,7 +121,7 @@ This should also open a Rviz session where it is possible to visualize the confi
 
 6. Run the controller
 ```bash
-ros2 run clik2_node_pkg clik_uam_node --ros-args -p real_system:=true -p k_err_pos_:=60.0 -p k_err_vel_:=60.0 -p control_rate_hz:=120.0
+ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=50.0 -p k_err_vel_:=50.0 -p control_rate_hz:=100.0 -p redundant:=false -p lambda_w:=1.0 -p redundant_ang_fb_scale_:=1.0
 ```
 7. Run the planner
 ```bash
@@ -131,24 +132,19 @@ ros2 run clik2_node_pkg planner
 
 ## Mathematics
 
-The algorithm computes in real-time the reference accelerations that manipulators motors must have in order to track the desired trajectory. This is done through:
+The controller computes **joint accelerations** $\ddot{\mathbf{q}}$ by solving, at each control step, the following optimization problem:
 
-$`  \left\{ \begin{array}{c} \ddot{\mathbf{q}}_b \\ \ddot{\mathbf{q}}_m \end{array} \right\} =
-\begin{bmatrix}
-[\mathbf{A}_b]&[\mathbf{A}_m] \\
-[\mathbf{J}_{b}]&[\mathbf{J}_{m}]
-\end{bmatrix}^{\dagger}
-\left\{ \begin{array}{c} \mathbf{z}_1 \\ \mathbf{z}_2 \end{array} \right\}
-`$
-  
+$$
+\argmin_{\ddot q} \| [\mathbf{J}_{gen}]\ddot{\mathbf{q}} - \dot{\mathbf{v}}_{des} \|_{W_{kin}} +  \| [\mathbf{H}_{M_R}]\ddot{\mathbf{q}} + \mathbf{n}_{M_R} \|_{W_{dyn}}
+$$
+
 where:
 
-- $`[\mathbf{A}_{b}] , [\mathbf{A}_{m}]`$ are the **Centroidal Momentum Matrices** relative to the base and the manipulator respectively.
-- $`[\mathbf{J}_{b}] , [\mathbf{J}_{m}]`$ are the **Jacobian Matrices** mapping base and joints generalized velocities to end-effector twist.
-- $`\mathbf{z}_1 = -[\dot{\mathbf{A}} ]\dot{\mathbf{q}}`$
-- $`\mathbf{z}_2 = \mathbf{a}_{\text{e,des}} - [\dot{\mathbf{J}}]\dot{\mathbf{q}} + [\mathbf{K}_P]\mathbf{e} + [\mathbf{K}_D]\dot{\mathbf{e}}`$
-- $`[\mathbf{K}_P]`$ is the proportional gain matrix. $`[\mathbf{K}_D]`$ is the derivative gain matrix.
-- $`\mathbf{e}`$ is EE pose error vector. $`\dot{\mathbf{e}}`$ is the EE velocity error.
+* $\mathbf{J}_{gen} = \mathbf{J}_m - \mathbf{J}_b \mathbf{H}_b^{-1} \mathbf{H}_m$ is the **generalized Jacobian** mapping joint accelerations to EE acceleration (task space reduced as needed), $\mathbf{H}_b, \mathbf{H}_m$ are submatrices of the inertia matrix of the entire aerial manipulator relative to the base and the manipulator respectively.
+* $\dot{\mathbf{v}}_{des}$ is the desired task-space acceleration with feedback terms,
+* $\mathbf{H}_{M_R}$ is the **reaction-moment inertia submatrix** (rows 3–6) of the **manipulator-only inertia matrix**,
+* $\mathbf{n}_{M_R}$ is the corresponding nonlinear term (Coriolis + centrifugal + gravity contribution, consistent with $\mathbf{H}_{M_R}$),
+* $λ_W$ = $W_{kin}/W_{dyn}$ is a scalar weight tuning the trade-off between tracking and reaction minimization.
 
 For more info check the paper (please consider citing):
 
