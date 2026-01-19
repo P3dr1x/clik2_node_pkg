@@ -82,14 +82,6 @@ def main():
             "'fixed' tiene la base ferma (mima il caso in cui il drone tenga la posa)."
         ),
     )
-    parser.add_argument(
-        "--jgen-mode",
-        choices=["cmm", "crba"],
-        default="cmm",
-        help=(
-            "Come calcolare Jgen: 'cmm' usa Ab^{-1}Am; 'crba' usa Hb^{-1}Hm (come nel nodo C++)."
-        ),
-    )
 
     parser.add_argument(
         "--k-err-pos",
@@ -102,6 +94,13 @@ def main():
         type=float,
         default=0.0,
         help="Guadagno feedback errore velocità EE (k_err_vel).",
+    )
+
+    parser.add_argument(
+        "--lambda-w",
+        type=float,
+        default=10.0,
+        help="Peso del termine cinematico nel QP (lambda_w).",
     )
 
     redundant_group = parser.add_mutually_exclusive_group()
@@ -134,7 +133,7 @@ def main():
     Kp = np.eye(6) * k_err_pos
     Kd = np.eye(6) * k_err_vel
 
-    lambda_w = 10.0
+    lambda_w = float(args.lambda_w)
     qp_lambda_reg = 1e-6
 
     # Regolarizzazione per l'inversione di Ab (CMM) in stile test_Jext_pinocchio.py
@@ -306,7 +305,7 @@ def main():
     print("\nAvvio simulazione UAM free-floating (CLIK2 QP)...")
     print(
         f"redundant={redundant} | have_osqp={have_osqp} | rate_hz={rate_hz} | "
-        f"realtime={args.realtime} | rt_scale={args.rt_scale} | base_mode={args.base_mode} | jgen_mode={args.jgen_mode}"
+        f"realtime={args.realtime} | rt_scale={args.rt_scale} | base_mode={args.base_mode}"
     )
 
     # Traiettoria circolare nel piano X-Z (WORLD), con legge quintica su theta per start/stop dolci
@@ -329,10 +328,10 @@ def main():
         # ========= Stato giunti (uniche variabili controllabili) =========
         qd_arm = v[idx_v_arm]
 
-        # ========= Matrici per vincolo base (CMM) e/o Jgen (CMM) =========
+        # ========= Matrici per vincolo base (CMM) =========
         Ab_reg = None
         Am_arm = None
-        if args.base_mode == "reflex_cmm" or args.jgen_mode == "cmm":
+        if args.base_mode == "reflex_cmm":
             pin.forwardKinematics(model, data, q)
             pin.computeCentroidalMap(model, data, q)
             Ag = np.array(data.Ag)
@@ -427,18 +426,14 @@ def main():
         Jb = J[:, :6]
         Jm = J[:, idx_v_arm]
 
-        if args.jgen_mode == "crba":
-            pin.crba(model, data, q)
-            M = np.array(data.M)
-            M = (M + M.T) * 0.5
-            Hb = M[:6, :6]
-            Hm = M[:6, idx_v_arm]
-            Hb_inv_Hm = np.linalg.solve(Hb, Hm)
-            Jgen = Jm - (Jb @ Hb_inv_Hm)
-        else:
-            # CMM-based (richiede Ab_reg/Am_arm)
-            Ab_inv_Am = np.linalg.solve(Ab_reg, Am_arm)
-            Jgen = Jm - (Jb @ Ab_inv_Am)
+        # Jacobiano generalizzato (come nel nodo C++): Jgen = Jm - Jb * Hb^{-1} * Hm
+        pin.crba(model, data, q)
+        M = np.array(data.M)
+        M = (M + M.T) * 0.5
+        Hb = M[:6, :6]
+        Hm = M[:6, idx_v_arm]
+        Hb_inv_Hm = np.linalg.solve(Hb, Hm)
+        Jgen = Jm - (Jb @ Hb_inv_Hm)
 
         if Jgen_prev is None:
             Jgen_prev = Jgen.copy()

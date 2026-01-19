@@ -730,23 +730,25 @@ void ClikUamNode::update()
     pinocchio::computeFrameJacobian(model_, data_, q_, ee_frame_id_, pinocchio::ReferenceFrame::LOCAL_WORLD_ALIGNED, J_);
 
     // === Jacobiano generalizzato Jgen ===
-    // Jgen = Jm - Jb * Ab^{-1} * Am
-    // dove Ab e Am sono estratti dalla matrice centroidale d'inerzia (CMM) Ag del modello completo.
-    // Ag mappa v_gen (base in LOCAL, giunti) nel momento centroidale (6D).
-    pinocchio::computeCentroidalMap(model_, data_, q_);
-    const Eigen::Matrix<double, 6, 6> Ab = data_.Ag.leftCols<6>();
-    Eigen::MatrixXd Am_arm(6, n_arm);
+    // Jgen = Jm - Jb * Hb^{-1} * Hm
+    // dove Hb e Hm sono estratti dall'inerzia del modello completo (UAM), mentre Jb/Jm dal Jacobiano del modello completo.
+    // Hm qui è la sottomatrice di accoppiamento base-manipolatore (solo colonne dei giunti del braccio controllati).
+    pinocchio::crba(model_, data_, q_);
+    data_.M.triangularView<Eigen::StrictlyLower>() = data_.M.transpose().triangularView<Eigen::StrictlyLower>();
+
+    Eigen::Matrix<double, 6, 6> Hb = data_.M.topLeftCorner<6, 6>();
+    Eigen::MatrixXd Hm_arm(6, n_arm);
     for (int i = 0; i < n_arm; ++i) {
-        Am_arm.col(i) = data_.Ag.col(idx_v_arm_[i]);
+        Hm_arm.col(i) = data_.M.block<6, 1>(0, idx_v_arm_[i]);
     }
 
-    Eigen::MatrixXd Ab_inv_Am(6, n_arm);
+    Eigen::MatrixXd Hb_inv_Hm(6, n_arm);
     {
-        Eigen::LDLT<Eigen::Matrix<double, 6, 6>> ldlt(Ab);
+        Eigen::LDLT<Eigen::Matrix<double, 6, 6>> ldlt(Hb);
         if (ldlt.info() == Eigen::Success) {
-            Ab_inv_Am = ldlt.solve(Am_arm);
+            Hb_inv_Hm = ldlt.solve(Hm_arm);
         } else {
-            Ab_inv_Am = Ab.completeOrthogonalDecomposition().solve(Am_arm);
+            Hb_inv_Hm = Hb.completeOrthogonalDecomposition().solve(Hm_arm);
         }
     }
 
@@ -755,7 +757,7 @@ void ClikUamNode::update()
     for (int i = 0; i < n_arm; ++i) {
         Jm_arm.col(i) = J_.col(idx_v_arm_[i]);
     }
-    const Eigen::MatrixXd Jgen = Jm_arm - (Jb * Ab_inv_Am);
+    const Eigen::MatrixXd Jgen = Jm_arm - (Jb * Hb_inv_Hm);
 
     const Eigen::Index m_total = static_cast<Eigen::Index>(model_.nv) - 6; // DoF manipolatore = nv - 6
     const Eigen::Index m_arm = static_cast<Eigen::Index>(arm_joints_.size());
@@ -993,7 +995,7 @@ void ClikUamNode::update()
     }
 
     // Integrazione secondo metodo di Eulero implicito con accelerazione totale
-    qd_int_       += qdd_total * dt;
+    qd_int_      += qdd_total * dt;
 
     // Aggiorna posizioni integrate
     q_pos_int_   += qd_int_ * dt;
