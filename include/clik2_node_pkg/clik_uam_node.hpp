@@ -90,6 +90,9 @@ private:
     pinocchio::Data::Matrix6x J_;
     pinocchio::FrameIndex ee_frame_id_;
 
+    // Frame base braccio nel modello completo (mobile_wx250s/base_link)
+    pinocchio::FrameIndex arm_base_frame_id_full_;
+
     // Pinocchio model for the manipulator only (FreeFlyer + arm) used for reaction-moment minimization
     pinocchio::Model model_man_;
     pinocchio::Data data_man_;

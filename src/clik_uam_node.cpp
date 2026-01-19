@@ -68,6 +68,14 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
     ee_frame_id_ = model_.getFrameId("mobile_wx250s/ee_gripper_link");
     RCLCPP_INFO(this->get_logger(), "End-effector frame ID: %d", static_cast<int>(ee_frame_id_));
 
+    // Frame base braccio (terna O) - serve per usare la twist della base del braccio (non del drone)
+    if (!model_.existFrame("mobile_wx250s/base_link")) {
+        RCLCPP_ERROR(this->get_logger(), "Frame 'mobile_wx250s/base_link' assente nel modello.");
+        rclcpp::shutdown();
+        return;
+    }
+    arm_base_frame_id_full_ = model_.getFrameId("mobile_wx250s/base_link");
+
     // Giunti controllati (gruppo "arm"). Definiti prima di precomputare gli indici.
     arm_joints_ = {"waist", "shoulder", "elbow", "forearm_roll", "wrist_angle", "wrist_rotate"};
 
@@ -747,7 +755,9 @@ void ClikUamNode::update()
 
     // 5. CALCOLO ERRORE POSE END-EFFECTOR
 
-    // Costruisci SE3 desiderata in WORLD
+    // Errore posa come in clik1_node_pkg / branch Jgen-MRmin:
+    // - posizione: e_pos = p_des - p_cur (WORLD)
+    // - orientazione: e_ang = log3(R_des * R_cur^T) (WORLD)
     Eigen::Quaterniond ee_des_quat(
         desired_ee_pose_world_.orientation.w,
         desired_ee_pose_world_.orientation.x,
@@ -762,19 +772,15 @@ void ClikUamNode::update()
         desired_ee_pose_world_.position.z
     );
 
-    pinocchio::SE3 T_des(R_des, p_des);
+    const Eigen::Vector3d p_cur = ee_placement.translation();
+    const Eigen::Vector3d e_pos = p_des - p_cur; // world
 
-    // Errore di posa SE3 in WORLD: T_err = T_des * T_cur^{-1}
-    //pinocchio::SE3 T_err = T_des * ee_placement.inverse();
-    pinocchio::SE3 T_err = ee_placement.inverse()* T_des;
+    const Eigen::Matrix3d R_cur = ee_placement.rotation();
+    const Eigen::Matrix3d R_err_world = R_des * R_cur.transpose();
+    const Eigen::Vector3d e_ang = pinocchio::log3(R_err_world); // world
 
-    // Logaritmo su SE(3) restituisce un twist nel frame locale del termine di errore.
-    // Convertiamolo al frame WORLD usando l'Adjoint della posa corrente dell'EE.
-    const Eigen::Matrix<double,6,1> err_body_al = pinocchio::log6(T_err).toVector(); 
-    const Eigen::Matrix<double,6,6> Ad_world_from_cur = ee_placement.toActionMatrix();
-    const Eigen::Matrix<double,6,1> err_world_al = Ad_world_from_cur * err_body_al; 
-    error_pose_ee_.head<3>() = err_world_al.head<3>(); // lin in WORLD
-    error_pose_ee_.tail<3>() = err_world_al.tail<3>(); // ang in WORLD
+    error_pose_ee_.head<3>() = e_pos;
+    error_pose_ee_.tail<3>() = e_ang;
 
     // 6. CALCOLO ERRORE DI VELOCITÀ END-EFFECTOR
 
@@ -809,16 +815,32 @@ void ClikUamNode::update()
     // Dinamica manipolatore-only per H_MR e n_mr (righe 3..5: momento base in frame body/LOCAL)
     q_man_.setZero();
     v_man_.setZero();
-    // base pose (free-flyer)
-    q_man_.segment<7>(0) = q_.segment<7>(0);
-    // joint positions/velocities (arm only)
+    // NOTA: la base del manipolatore-only corrisponde a mobile_wx250s/base_link (non al link base del drone)
+    // Posa di O (mobile_wx250s/base_link) nel mondo dal modello completo
+    const pinocchio::SE3 &T_w_O = data_.oMf[arm_base_frame_id_full_];
+    q_man_.segment<3>(0) = T_w_O.translation();
+    Eigen::Quaterniond q_O(T_w_O.rotation());
+    q_O.normalize();
+    q_man_[3] = q_O.x();
+    q_man_[4] = q_O.y();
+    q_man_[5] = q_O.z();
+    q_man_[6] = q_O.w();
+
+    // Copia posizioni giunti braccio (ordine arm_joints_)
     for (int i = 0; i < n_arm; ++i) {
         q_man_[idx_q_arm_man_[i]] = q_arm_meas[i];
-        v_man_[idx_v_arm_man_[i]] = qd_arm_meas[i];
     }
-    // base twist in LOCAL
-    v_man_.segment<3>(0) = vlin_base_local;
-    v_man_.segment<3>(3) = omega_base_local;
+
+    // Twist della base del braccio (LOCAL di O) dal modello completo
+    const pinocchio::Motion V_O_local = pinocchio::getFrameVelocity(
+        model_, data_, arm_base_frame_id_full_, pinocchio::ReferenceFrame::LOCAL);
+    v_man_.segment<3>(0) = V_O_local.linear();
+    v_man_.segment<3>(3) = V_O_local.angular();
+
+    // Copia velocità giunti braccio
+    for (int i = 0; i < n_arm; ++i) {
+        v_man_[idx_v_arm_man_[i]] = v_gen_meas[idx_v_arm_[i]];
+    }
     pinocchio::normalize(model_man_, q_man_);
 
     pinocchio::crba(model_man_, data_man_, q_man_);
