@@ -135,7 +135,7 @@ ros2 run clik2_node_pkg planner
 The controller computes **joint accelerations** $\ddot{\mathbf{q}}$ by solving, at each control step, the following optimization problem:
 
 $$
-\argmin_{\ddot q} \| [\mathbf{J}_{gen}]\ddot{\mathbf{q}} - \dot{\mathbf{v}}_{des} \|_{W_{kin}} +  \| [\mathbf{H}_{M_R}]\ddot{\mathbf{q}} + \mathbf{n}_{M_R} \|_{W_{dyn}}
+\ddot{\mathbf{q}} = \text{argmin} \| [\mathbf{J}_{gen}]\ddot{\mathbf{q}} - \dot{\mathbf{v}}_{des} \|_{W_{kin}} +  \| [\mathbf{H}_{M_R}]\ddot{\mathbf{q}} + \mathbf{n}_{M_R} \|_{W_{dyn}}
 $$
 
 where:
