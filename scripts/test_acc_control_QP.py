@@ -2,7 +2,7 @@
 """test_acc_control_QP.py
 
 Prototipo Python per il controllo CLIK2 a livello accelerazioni (stile nodo C++),
-ma con base free-floating ("drone fluttuante") e gravità disattivata.
+ma con base free-floating ("drone fluttuante").
 
 Serve per fare prove veloci e capire il comportamento in modalità ridondante
 (tracking solo accelerazione lineare).
@@ -71,15 +71,17 @@ def main():
         help="Fattore di scala del tempo reale (1=tempo reale, >1 più lento, <1 più veloce).",
     )
 
-    # Modalità simulazione base/Jgen per confrontare con il nodo C++
+    # Modalità evoluzione base (solo per prototipo)
+    # - reactionless_dyn: base si muove in modo coerente con Jgen (v_b = -H_b^{-1} H_m qd)
+    # - fixed: base bloccata (mima drone che stabilizza la posa)
     parser.add_argument(
         "--base-mode",
-        choices=["reflex_cmm", "fixed"],
-        default="reflex_cmm",
+        choices=["reactionless_dyn", "fixed"],
+        default="reactionless_dyn",
         help=(
             "Come evolve la base: "
-            "'reflex_cmm' impone Ab*v_base + Am*qd_arm = 0 (stile test_Jext_pinocchio); "
-            "'fixed' tiene la base ferma (mima il caso in cui il drone tenga la posa)."
+            "'reactionless_dyn' impone v_base = -Hb^{-1}Hm*qd_arm (coerente con Jgen); "
+            "'fixed' tiene la base ferma."
         ),
     )
 
@@ -103,20 +105,47 @@ def main():
         help="Peso del termine cinematico nel QP (lambda_w).",
     )
 
-    redundant_group = parser.add_mutually_exclusive_group()
-    redundant_group.add_argument(
-        "--redundant",
-        dest="redundant",
-        action="store_true",
-        help="Task ridondante 3D: usa solo accelerazione lineare EE (ignora parte angolare nel costo).",
+    # Traiettoria desiderata EE: cerchio nel piano X-Z (WORLD)
+    parser.add_argument(
+        "--circle-radius",
+        type=float,
+        default=0.10,
+        help="Raggio della traiettoria circolare dell'EE [m] (piano X-Z in WORLD).",
     )
-    redundant_group.add_argument(
-        "--no-redundant",
-        dest="redundant",
-        action="store_false",
-        help="Task 6D: usa accelerazione lineare+angolare EE nel costo cinematica.",
+    parser.add_argument(
+        "--circle-period",
+        type=float,
+        default=12.0,
+        help="Periodo per completare un giro completo della traiettoria [s].",
     )
-    parser.set_defaults(redundant=True)
+
+    # Penalizzazione sul movimento di giunti specifici (su qdd)
+    parser.add_argument(
+        "--w-qdd-waist",
+        type=float,
+        default=10,
+        help="Peso su qdd del giunto 'waist' (aumenta => meno movimento).",
+    )
+    parser.add_argument(
+        "--w-qdd-forearm-roll",
+        type=float,
+        default=25,
+        help="Peso su qdd del giunto 'forearm_roll' (aumenta => meno movimento).",
+    )
+    parser.add_argument(
+        "--w-qdd-wrist-rotate",
+        type=float,
+        default=25,
+        help="Peso su qdd del giunto 'wrist_rotate' (aumenta => meno movimento).",
+    )
+
+    # Solo due casi, come da istruzioni: task 6D e task 3D (solo posizione)
+    parser.add_argument(
+        "--task",
+        choices=["3d", "6d"],
+        default="3d",
+        help="Task-space da tracciare: '3d' solo posizione (x,y,z), '6d' posizione+orientazione.",
+    )
     args = parser.parse_args()
 
     # =============================
@@ -125,8 +154,11 @@ def main():
     rate_hz = 120.0
     dt = 1.0 / rate_hz
 
-    T_total = 12.0  # [s]
-    radius = 0.10  # [m] raggio traiettoria circolare (piano X-Z in WORLD)
+    T_total = 12.0  # [s] durata simulazione
+    radius = float(args.circle_radius)
+    circle_period = float(args.circle_period)
+    if circle_period <= 0.0:
+        raise ValueError("--circle-period deve essere > 0")
 
     k_err_pos = float(args.k_err_pos)
     k_err_vel = float(args.k_err_vel)
@@ -134,15 +166,27 @@ def main():
     Kd = np.eye(6) * k_err_vel
 
     lambda_w = float(args.lambda_w)
-    qp_lambda_reg = 1e-6
+    qp_lambda_reg = 1e-3  # regolarizzazione QP per stabilità numerica
 
-    # Regolarizzazione per l'inversione di Ab (CMM) in stile test_Jext_pinocchio.py
-    eps_Ab = 1e-9
+    # Penalizzazione su qdd per ridurre movimenti inutili in ridondanza
+    w_qdd_by_name = {
+        "waist": float(args.w_qdd_waist),
+        "forearm_roll": float(args.w_qdd_forearm_roll),
+        "wrist_rotate": float(args.w_qdd_wrist_rotate),
+    }
 
-    # Modalità ridondante: task cinematica SOLO lineare (3D)
-    redundant = bool(args.redundant)
+    # Modalità task: 3D (solo lineare) oppure 6D
+    task_is_3d = (str(args.task).lower() == "3d")
 
     joint_vel_limit_default = 2.0  # [rad/s] fallback se URDF non ha velocityLimit
+
+    # Limiti box su accelerazioni (qdd) per i giunti del gruppo ARM_JOINTS.
+    # Richiesta: 15 rad/s^2 per waist e shoulder, poi +0.5 rad/s^2 per ogni giunto successivo.
+    qdd_limit_arm = np.zeros(len(ARM_JOINTS), dtype=float)
+    qdd_limit_arm[0] = 15.0  # waist
+    qdd_limit_arm[1] = 15.0  # shoulder
+    for j in range(2, len(ARM_JOINTS)):
+        qdd_limit_arm[j] = 15.0 + 0.5 * float(j - 1)
 
     # =============================
     # MODELS
@@ -194,6 +238,13 @@ def main():
     idx_v_arm, idx_q_arm = arm_joint_indices(model, ARM_JOINTS)
     idx_v_arm_man, idx_q_arm_man = arm_joint_indices(model_man, ARM_JOINTS)
     n_arm = len(ARM_JOINTS)
+
+    # Diagonale pesi su qdd (nell'ordine ARM_JOINTS)
+    w_qdd = np.zeros(n_arm)
+    for j, jname in enumerate(ARM_JOINTS):
+        w_qdd[j] = float(w_qdd_by_name.get(jname, 0.0))
+    if np.any(w_qdd < 0.0):
+        raise ValueError("I pesi --w-qdd-* devono essere >= 0")
 
     # Limiti URDF (se presenti)
     have_pos_lim = hasattr(model_man, "lowerPositionLimit") and (len(model_man.lowerPositionLimit) == model_man.nq)
@@ -304,14 +355,14 @@ def main():
 
     print("\nAvvio simulazione UAM free-floating (CLIK2 QP)...")
     print(
-        f"redundant={redundant} | have_osqp={have_osqp} | rate_hz={rate_hz} | "
+        f"task={args.task} | have_osqp={have_osqp} | rate_hz={rate_hz} | "
         f"realtime={args.realtime} | rt_scale={args.rt_scale} | base_mode={args.base_mode}"
     )
 
-    # Traiettoria circolare nel piano X-Z (WORLD), con legge quintica su theta per start/stop dolci
+    # Traiettoria circolare nel piano X-Z (WORLD), velocità angolare costante
     center = p0.copy()
     center[0] = p0[0] - radius
-    omega_2pi = 2.0 * np.pi
+    omega = (2.0 * np.pi) / circle_period
 
     # Loop deterministico con numero di passi fissato (stile test_Jext_pinocchio.py)
     N_steps = int(round(T_total / dt))
@@ -328,72 +379,52 @@ def main():
         # ========= Stato giunti (uniche variabili controllabili) =========
         qd_arm = v[idx_v_arm]
 
-        # ========= Matrici per vincolo base (CMM) =========
-        Ab_reg = None
-        Am_arm = None
-        if args.base_mode == "reflex_cmm":
-            pin.forwardKinematics(model, data, q)
-            pin.computeCentroidalMap(model, data, q)
-            Ag = np.array(data.Ag)
-            Ab = Ag[:, :6]
-            Am_arm = Ag[:, idx_v_arm]
-            Ab_reg = Ab + eps_Ab * np.eye(6)
+        # ========= Dinamica full: M(q), blocchi Hb/Hm per coupling base-arm =========
+        # Nota: crba richiede solo q (non v). Usiamo questi blocchi sia per v_base sia per Jgen.
+        pin.crba(model, data, q)
+        M = np.array(data.M)
+        M = (M + M.T) * 0.5
+        Hb = M[:6, :6]
+        Hm = M[:6, idx_v_arm]
+        Hb_inv_Hm = np.linalg.solve(Hb, Hm)
 
-        # ========= Base =========
-        if args.base_mode == "reflex_cmm":
-            # Impone h = Ag*v = 0 => Ab*v_base + Am*qd_arm = 0
-            v_base = -np.linalg.solve(Ab_reg, (Am_arm @ qd_arm))
-            v[0:6] = v_base
+        # ========= Base (coerente con Jgen) =========
+        if args.base_mode == "reactionless_dyn":
+            # v_base = -Hb^{-1}Hm * qd_arm
+            v[0:6] = -(Hb_inv_Hm @ qd_arm)
         else:
-            # Base ferma (mima drone che tiene la posa)
             v[0:6] = 0.0
 
         # ========= Traiettoria desiderata in WORLD (pos/vel/acc lineare, orientazione costante) =========
-        if t <= T_total:
-            s = t / T_total
-            s3 = s**3
-            s4 = s**4
-            s5 = s**5
-            s_pos = 10.0 * s3 - 15.0 * s4 + 6.0 * s5
-            s_vel = (30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4) / T_total
-            s_acc = (60.0 * s - 180.0 * s**2 + 120.0 * s**3) / (T_total**2)
+        # Cerchio a velocità angolare costante (nessuno start/stop quintico).
+        theta = omega * t
+        theta_dot = omega
+        theta_ddot = 0.0
 
-            theta = omega_2pi * s_pos
-            theta_dot = omega_2pi * s_vel
-            theta_ddot = omega_2pi * s_acc
+        p_des = center.copy()
+        p_des[0] = center[0] + radius * np.cos(theta)
+        p_des[2] = center[2] + radius * np.sin(theta)
 
-            p_des = center.copy()
-            p_des[0] = center[0] + radius * np.cos(theta)
-            p_des[2] = center[2] + radius * np.sin(theta)
-
-            v_lin_des = np.array(
-                [
-                    -radius * np.sin(theta) * theta_dot,
-                    0.0,
-                    radius * np.cos(theta) * theta_dot,
-                ]
-            )
-            a_lin_des = np.array(
-                [
-                    (-radius * np.cos(theta) * (theta_dot**2)) + (-radius * np.sin(theta) * theta_ddot),
-                    0.0,
-                    (-radius * np.sin(theta) * (theta_dot**2)) + (radius * np.cos(theta) * theta_ddot),
-                ]
-            )
-        else:
-            # Mantieni l'ultimo punto a t = T_total
-            theta = omega_2pi
-            p_des = center.copy()
-            p_des[0] = center[0] + radius * np.cos(theta)
-            p_des[2] = center[2] + radius * np.sin(theta)
-            v_lin_des = np.zeros(3)
-            a_lin_des = np.zeros(3)
+        v_lin_des = np.array(
+            [
+                -radius * np.sin(theta) * theta_dot,
+                0.0,
+                radius * np.cos(theta) * theta_dot,
+            ]
+        )
+        a_lin_des = np.array(
+            [
+                -radius * np.cos(theta) * (theta_dot**2) + (-radius * np.sin(theta) * theta_ddot),
+                0.0,
+                -radius * np.sin(theta) * (theta_dot**2) + (radius * np.cos(theta) * theta_ddot),
+            ]
+        )
 
         omega_des = np.zeros(3)
         alpha_des = np.zeros(3)
         v_des = np.hstack([v_lin_des, omega_des])
         a_des = np.hstack([a_lin_des, alpha_des])
-        #a_des = np.hstack([np.zeros(3), np.zeros(3)])
+
 
 
         # ========= Kinematics =========
@@ -416,7 +447,7 @@ def main():
         e_vel = v_des - v_ee_meas
 
         fb = (Kp @ e_pose) + (Kd @ e_vel)
-        if redundant:
+        if task_is_3d:
             fb[3:] = 0.0
 
         # ========= Jacobiano full + Jacobiano generalizzato =========
@@ -426,13 +457,7 @@ def main():
         Jb = J[:, :6]
         Jm = J[:, idx_v_arm]
 
-        # Jacobiano generalizzato (come nel nodo C++): Jgen = Jm - Jb * Hb^{-1} * Hm
-        pin.crba(model, data, q)
-        M = np.array(data.M)
-        M = (M + M.T) * 0.5
-        Hb = M[:6, :6]
-        Hm = M[:6, idx_v_arm]
-        Hb_inv_Hm = np.linalg.solve(Hb, Hm)
+        # Jacobiano generalizzato (coerente con v_base = -Hb^{-1}Hm*qd)
         Jgen = Jm - (Jb @ Hb_inv_Hm)
 
         if Jgen_prev is None:
@@ -445,7 +470,7 @@ def main():
 
         # Tracking accelerazione usando Jacobiano geometrico (LOCAL_WORLD_ALIGNED).
         # Nel prototipo assumiamo la relazione: d/dt(V_ee) = Jgen*qdd + Jgen_dot*qd
-        # e imponiamo solo le prime 3 componenti (accelerazione lineare).
+        # e imponiamo (a scelta) 6D oppure solo le prime 3 componenti lineari.
         vdot_des = a_des + fb - Jgen_dot_qd
 
         # ========= Manipolatore-only: H_MR e n_mr =========
@@ -476,7 +501,7 @@ def main():
         n_mr = nle_man[3:6]
 
         # ========= QP: min 0.5*lambda_w||J*qdd - vdot_des||^2 + 0.5||H_MR*qdd + n||^2 =========
-        if redundant:
+        if task_is_3d:
             J_task = Jgen[0:3, :]
             v_task = vdot_des[0:3]
         else:
@@ -485,6 +510,8 @@ def main():
 
         P = (lambda_w * (J_task.T @ J_task)) + (H_mr.T @ H_mr)
         P = 0.5 * (P + P.T)
+        if np.any(w_qdd > 0.0):
+            P = P + np.diag(w_qdd)
         P = P + np.eye(n_arm) * qp_lambda_reg
         g = (H_mr.T @ n_mr) - (lambda_w * (J_task.T @ v_task))
 
@@ -507,6 +534,11 @@ def main():
                 u_pos = (2.0 * (q_upper[j] - q_i - dt * dq_i)) / dt2
                 l[j] = max(l[j], l_pos)
                 u[j] = min(u[j], u_pos)
+
+            # Vincoli box su accelerazione (sempre attivi): -qdd_lim <= qdd <= +qdd_lim
+            qdd_lim = float(qdd_limit_arm[j])
+            l[j] = max(l[j], -abs(qdd_lim))
+            u[j] = min(u[j], +abs(qdd_lim))
             if l[j] > u[j]:
                 l[j] = u[j]
 
@@ -519,9 +551,9 @@ def main():
         v_base_prev = v[0:6].copy()
         qd_arm_next = qd_arm + qdd_arm * dt
 
-        if args.base_mode == "reflex_cmm":
-            # Ricava la velocità base dal vincolo h=0 (stesso Ab/Am del passo corrente)
-            v_base_next = -np.linalg.solve(Ab_reg, (Am_arm @ qd_arm_next))
+        if args.base_mode == "reactionless_dyn":
+            # Coerente con la definizione di Jgen: v_base_next = -Hb^{-1}Hm * qd_arm_next
+            v_base_next = -(Hb_inv_Hm @ qd_arm_next)
         else:
             v_base_next = np.zeros(6)
 
@@ -640,7 +672,7 @@ def main():
         ax3d.plot(ee_p[:, 0], ee_p[:, 1], ee_p[:, 2], label="EE actual")
         ax3d.scatter(ee_p[0, 0], ee_p[0, 1], ee_p[0, 2], c="g", s=40, label="start")
         ax3d.scatter(ee_p[-1, 0], ee_p[-1, 1], ee_p[-1, 2], c="r", s=40, label="end")
-        ax3d.scatter(ee_p_des[-1, 0], ee_p_des[-1, 1], ee_p_des[-1, 2], c="k", s=30, label="desired end")
+        #ax3d.scatter(ee_p_des[-1, 0], ee_p_des[-1, 1], ee_p_des[-1, 2], c="k", s=30, label="desired end")
         ax3d.set_xlabel("X [m]")
         ax3d.set_ylabel("Y [m]")
         ax3d.set_zlabel("Z [m]")
