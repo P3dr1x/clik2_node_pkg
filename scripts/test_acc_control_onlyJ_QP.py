@@ -8,7 +8,15 @@ Obiettivo (come da J_Red_QP_instructions.md):
     min_qdd || J*qdd - vdot_des ||^2
     vdot_des = vdot_ref + Kp*e + Kd*e_dot - Jdot*qd
 
-Per la prova più semplice il drone/base è sempre FIXED (v_base = 0).
+Estensione (seconda versione nelle istruzioni): aggiunge un termine di costo
+per minimizzare il momento di reazione tra braccio e base:
+    + || H_MR*qdd + n_MR ||^2
+con H_MR e n_MR ricavati dal modello del manipolatore con base free-flyer.
+
+La base può essere:
+    - FIXED (default)
+    - fluttuante in modalità "reactionless_dyn" imponendo conservazione del momento
+        (v_base = -Hb^{-1}Hm*qd_arm)
 
 Dipendenze: pinocchio, numpy. OSQP opzionale.
 """
@@ -25,6 +33,10 @@ EE_FRAME = "mobile_wx250s/ee_gripper_link"
 
 
 ARM_JOINTS = ["waist", "shoulder", "elbow", "forearm_roll", "wrist_angle", "wrist_rotate"]
+
+# Giunti gripper (nel wx250s.urdf). Se lockati nel modello usato per H_MR/n_MR,
+# l'inerzia del gripper viene considerata come carico rigido senza aggiungere DOF al QP.
+GRIPPER_JOINTS = ["gripper", "left_finger", "right_finger"]
 
 
 def find_urdf_and_pkg_dir():
@@ -52,7 +64,7 @@ def main():
     # =============================
     # CLI
     # =============================
-    parser = argparse.ArgumentParser(description="Simulazione CLIK2 QP (accelerazioni) con base FIXED e Jacobiano classico")
+    parser = argparse.ArgumentParser(description="Simulazione CLIK2 QP (accelerazioni) Jacobiano-only con base fixed o reactionless")
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--realtime",
@@ -74,7 +86,20 @@ def main():
         help="Fattore di scala del tempo reale (1=tempo reale, >1 più lento, <1 più veloce).",
     )
 
-    # Nota: per questa prova la base è sempre FIXED.
+    # Modalità evoluzione base (solo per prototipo)
+    # - reactionless_dyn: base si muove in modo coerente con conservazione del momento
+    #   (v_base = -Hb^{-1}Hm*qd_arm, come in test_acc_control_QP.py)
+    # - fixed: base bloccata
+    parser.add_argument(
+        "--base-mode",
+        choices=["reactionless_dyn", "fixed"],
+        default="fixed",
+        help=(
+            "Come evolve la base: "
+            "'reactionless_dyn' impone v_base = -Hb^{-1}Hm*qd_arm (conservazione del momento); "
+            "'fixed' tiene la base ferma (default)."
+        ),
+    )
 
     parser.add_argument(
         "--k-err-pos",
@@ -90,10 +115,35 @@ def main():
     )
 
     parser.add_argument(
-        "--lambda-w",
+        "--w-kin",
         type=float,
         default=10.0,
-        help="Peso del termine cinematico nel QP (lambda_w).",
+        help="Peso del costo cinematico (tracking) nel QP.",
+    )
+    parser.add_argument(
+        "--w-dyn",
+        type=float,
+        default=1.0,
+        help="Peso del costo dinamico (reaction-moment) nel QP.",
+    )
+
+    parser.add_argument(
+        "--dyn-lock-gripper",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Se attivo (default), blocca i giunti del gripper nel modello usato per calcolare H_MR e n_MR. "
+            "Così l'inerzia del gripper è inclusa nel costo dinamico senza aggiungere variabili al QP."
+        ),
+    )
+
+    parser.add_argument(
+        "--dyn-disable-gravity",
+        action="store_true",
+        help=(
+            "Se attivo, azzera la gravità nel modello usato per calcolare H_MR e n_MR. "
+            "Utile come test diagnostico: n_MR non include il contributo del peso."
+        ),
     )
 
     # Traiettoria desiderata EE: cerchio nel piano X-Z (WORLD)
@@ -145,7 +195,7 @@ def main():
     rate_hz = 120.0
     dt = 1.0 / rate_hz
 
-    T_total = 12.0  # [s] durata simulazione
+    T_total = float(args.circle_period)  # [s] durata simulazione
     radius = float(args.circle_radius)
     circle_period = float(args.circle_period)
     if circle_period <= 0.0:
@@ -156,8 +206,11 @@ def main():
     Kp = np.eye(6) * k_err_pos
     Kd = np.eye(6) * k_err_vel
 
-    lambda_w = float(args.lambda_w)
-    qp_lambda_reg = 1e-3  # regolarizzazione QP per stabilità numerica
+    w_kin = float(args.w_kin)
+    w_dyn = float(args.w_dyn)
+    if w_kin < 0.0 or w_dyn < 0.0:
+        raise ValueError("I pesi --w-kin e --w-dyn devono essere >= 0")
+    qp_lambda_reg = 1e-2  # regolarizzazione QP per stabilità numerica
 
     # Penalizzazione su qdd per ridurre movimenti inutili in ridondanza
     w_qdd_by_name = {
@@ -194,11 +247,32 @@ def main():
         wx_urdf = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model", "wx250s.urdf"))
     if not os.path.exists(wx_urdf):
         raise FileNotFoundError(f"URDF manipolatore non trovato (wx250s.urdf): {wx_urdf}")
-    # Modello manipolatore-only usato per leggere limiti (pos/vel) dal suo URDF.
+    # Modello manipolatore-only "pieno" (include anche gripper e dita).
     model_man = pin.buildModelFromUrdf(wx_urdf, pin.JointModelFreeFlyer())
 
+    # Modello usato per il costo dinamico: opzionalmente ridotto lockando i giunti del gripper.
+    model_dyn = model_man
+    if args.dyn_lock_gripper:
+        q0_lock = pin.neutral(model_man)
+        joints_to_lock = []
+        for jn in GRIPPER_JOINTS:
+            if model_man.existJointName(jn):
+                joints_to_lock.append(model_man.getJointId(jn))
+        if len(joints_to_lock) > 0:
+            model_dyn = pin.buildReducedModel(model_man, joints_to_lock, q0_lock)
+
+    # Opzione diagnostica: rimuove il contributo della gravità in nonLinearEffects() del costo dinamico.
+    if args.dyn_disable_gravity:
+        try:
+            model_dyn.gravity.linear[:] = 0.0
+        except Exception:
+            try:
+                model_dyn.gravity.linear = np.zeros(3)
+            except Exception:
+                pass
+
     data = model.createData()
-    # data_man non serve in questa versione (nessun termine dinamico/reaction minimization)
+    data_dyn = model_dyn.createData()
 
     q = pin.neutral(model)
     v = np.zeros(model.nv)
@@ -207,7 +281,9 @@ def main():
         raise RuntimeError(f"Frame EE non trovato: {EE_FRAME}")
     ee_frame_id = model.getFrameId(EE_FRAME)
 
-    # Base fixed: non serve il frame base_link per importare dinamica manipolatore-only.
+    if not model.existFrame("mobile_wx250s/base_link"):
+        raise RuntimeError("Frame 'mobile_wx250s/base_link' non trovato nel modello completo")
+    arm_base_frame_id_full = model.getFrameId("mobile_wx250s/base_link")
 
     # =============================
     # INDICI GIUNTI
@@ -226,7 +302,7 @@ def main():
         return idx_v, idx_q
 
     idx_v_arm, idx_q_arm = arm_joint_indices(model, ARM_JOINTS)
-    idx_v_arm_man, idx_q_arm_man = arm_joint_indices(model_man, ARM_JOINTS)
+    idx_v_arm_dyn, idx_q_arm_dyn = arm_joint_indices(model_dyn, ARM_JOINTS)
     n_arm = len(ARM_JOINTS)
 
     # Diagonale pesi su qdd (nell'ordine ARM_JOINTS)
@@ -237,17 +313,17 @@ def main():
         raise ValueError("I pesi --w-qdd-* devono essere >= 0")
 
     # Limiti URDF (se presenti)
-    have_pos_lim = hasattr(model_man, "lowerPositionLimit") and (len(model_man.lowerPositionLimit) == model_man.nq)
-    have_vel_lim = hasattr(model_man, "velocityLimit") and (len(model_man.velocityLimit) == model_man.nv)
+    have_pos_lim = hasattr(model_dyn, "lowerPositionLimit") and (len(model_dyn.lowerPositionLimit) == model_dyn.nq)
+    have_vel_lim = hasattr(model_dyn, "velocityLimit") and (len(model_dyn.velocityLimit) == model_dyn.nv)
     q_lower = np.full(n_arm, -np.inf)
     q_upper = np.full(n_arm, +np.inf)
     v_limit = np.zeros(n_arm)
     for i in range(n_arm):
         if have_pos_lim:
-            q_lower[i] = float(model_man.lowerPositionLimit[idx_q_arm_man[i]])
-            q_upper[i] = float(model_man.upperPositionLimit[idx_q_arm_man[i]])
+            q_lower[i] = float(model_dyn.lowerPositionLimit[idx_q_arm_dyn[i]])
+            q_upper[i] = float(model_dyn.upperPositionLimit[idx_q_arm_dyn[i]])
         if have_vel_lim:
-            v_limit[i] = float(model_man.velocityLimit[idx_v_arm_man[i]])
+            v_limit[i] = float(model_dyn.velocityLimit[idx_v_arm_dyn[i]])
 
     # =============================
     # QP SOLVER (OSQP opzionale)
@@ -335,16 +411,18 @@ def main():
     ee_p_des_log = []
     err_pos_log = []
 
-    # Confronto accelerazioni EE (prime 3 componenti lineari)
-    a_lin_ref_log = []
-    a_lin_class_log = []
-    a_lin_spatial_log = []
+    # Norma del residuo di reazione: ||H_MR*qdd + n_MR|| (3x1)
+    react_moment_norm_log = []
 
-    # Buffer per Jdot (solo colonne braccio)
+    # Buffer per Jdot (solo Jacobiano classico: colonne braccio)
     Jm_prev = None
 
-    print("\nAvvio simulazione UAM (base FIXED, Jacobiano classico, CLIK2 QP)...")
-    print(f"task={args.task} | have_osqp={have_osqp} | rate_hz={rate_hz} | realtime={args.realtime} | rt_scale={args.rt_scale}")
+    print("\nAvvio simulazione UAM (Jacobiano-only, CLIK2 QP)...")
+    print(
+        f"task={args.task} | have_osqp={have_osqp} | rate_hz={rate_hz} | "
+        f"realtime={args.realtime} | rt_scale={args.rt_scale} | base_mode={args.base_mode} | "
+        f"w_kin={w_kin} | w_dyn={w_dyn} | dyn_disable_gravity={args.dyn_disable_gravity}"
+    )
 
     # Traiettoria circolare nel piano X-Z (WORLD), velocità angolare costante
     center = p0.copy()
@@ -366,8 +444,21 @@ def main():
         # ========= Stato giunti (uniche variabili controllabili) =========
         qd_arm = v[idx_v_arm]
 
-        # ========= Base FIXED =========
-        v[0:6] = 0.0
+        # ========= Base: fixed oppure reactionless (conservazione del momento) =========
+        Hb_inv_Hm = None
+        if args.base_mode == "reactionless_dyn":
+            # Dinamica full: M(q) e blocchi Hb/Hm per coupling base-arm
+            pin.crba(model, data, q)
+            M = np.array(data.M)
+            M = (M + M.T) * 0.5
+            Hb = M[:6, :6]
+            Hm = M[:6, idx_v_arm]
+            Hb_inv_Hm = np.linalg.solve(Hb, Hm)
+
+            # v_base = -Hb^{-1}Hm * qd_arm
+            v[0:6] = -(Hb_inv_Hm @ qd_arm)
+        else:
+            v[0:6] = 0.0
 
         # ========= Traiettoria desiderata in WORLD (pos/vel/acc lineare, orientazione costante) =========
         # Cerchio a velocità angolare costante (nessuno start/stop quintico).
@@ -428,7 +519,7 @@ def main():
         pin.computeJointJacobians(model, data, q)
         J = pin.computeFrameJacobian(model, data, q, ee_frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
 
-        # Base fixed -> usiamo solo le colonne del braccio.
+        # Colonne braccio del Jacobiano classico
         Jm = J[:, idx_v_arm]
 
         # Jdot*qd (differenze finite su Jm)
@@ -443,7 +534,38 @@ def main():
         # Come da istruzioni: vdot_des = vdot_ref + Kp*e + Kd*e_dot - Jdot*qd
         vdot_des = a_des + fb - Jm_dot_qd
 
-        # ========= QP: min 0.5*lambda_w||J*qdd - vdot_des||^2 =========
+        # ========= Termine dinamico (reaction moment) =========
+        # Ricava H_MR e n_MR dal modello del manipolatore con base free-flyer.
+        # Se --dyn-lock-gripper è attivo, il modello dinamico ha i giunti gripper/dita lockati
+        # (l'inerzia dei link del gripper resta inclusa come carico rigido).
+        q_dyn = pin.neutral(model_dyn)
+        v_dyn = np.zeros(model_dyn.nv)
+
+        T_w_O = data.oMf[arm_base_frame_id_full]
+        q_dyn[0:3] = np.array(T_w_O.translation).reshape(3)
+        qO = pin.Quaternion(np.array(T_w_O.rotation))
+        q_dyn[3:7] = np.array([qO.x, qO.y, qO.z, qO.w])
+
+        for j in range(n_arm):
+            q_dyn[idx_q_arm_dyn[j]] = q[idx_q_arm[j]]
+
+        V_O_local = pin.getFrameVelocity(model, data, arm_base_frame_id_full, pin.ReferenceFrame.LOCAL)
+        v_dyn[0:3] = np.array(V_O_local.linear).reshape(3)
+        v_dyn[3:6] = np.array(V_O_local.angular).reshape(3)
+        for j in range(n_arm):
+            v_dyn[idx_v_arm_dyn[j]] = v[idx_v_arm[j]]
+
+        pin.normalize(model_dyn, q_dyn)
+        pin.crba(model_dyn, data_dyn, q_dyn)
+        M_dyn = np.array(data_dyn.M)
+        M_dyn = (M_dyn + M_dyn.T) * 0.5
+        nle_dyn = np.array(pin.nonLinearEffects(model_dyn, data_dyn, q_dyn, v_dyn)).reshape(-1)
+
+        # Reaction moment: righe angolari del free-flyer (3..5), colonne dei giunti braccio.
+        H_mr = M_dyn[3:6, idx_v_arm_dyn]
+        n_mr = nle_dyn[3:6]
+
+        # ========= QP: tracking + minimizzazione momento di reazione =========
         if task_is_3d:
             J_task = Jm[0:3, :]
             v_task = vdot_des[0:3]
@@ -451,12 +573,12 @@ def main():
             J_task = Jm
             v_task = vdot_des
 
-        P = (lambda_w * (J_task.T @ J_task))
+        P = (w_kin * (J_task.T @ J_task)) + (w_dyn * (H_mr.T @ H_mr))
         P = 0.5 * (P + P.T)
         if np.any(w_qdd > 0.0):
             P = P + np.diag(w_qdd)
         P = P + np.eye(n_arm) * qp_lambda_reg
-        g = -(lambda_w * (J_task.T @ v_task))
+        g = (w_dyn * (H_mr.T @ n_mr)) - (w_kin * (J_task.T @ v_task))
 
         # bounds su qdd da limiti vel/pos
         l = np.full(n_arm, -np.inf)
@@ -489,36 +611,26 @@ def main():
         if qdd_arm is None:
             qdd_arm = np.zeros(n_arm)
 
+        # Diagnostica: quanto è "piccolo" il termine di reazione effettivamente ottenuto
+        # (indipendente da w_dyn: utile anche per valutare il compromesso col tracking).
+        react_moment = (H_mr @ qdd_arm) + n_mr
+        react_moment_norm = float(np.linalg.norm(react_moment))
+
         # ========= Integrazione: comando solo qdd_arm; la base si muove "di riflesso" =========
         # Aggiorna velocità giunti (uniche controllabili)
-        v_base_prev = v[0:6].copy()
         qd_arm_next = qd_arm + qdd_arm * dt
 
-        # Base FIXED
-        v_base_next = np.zeros(6)
+        if args.base_mode == "reactionless_dyn":
+            if Hb_inv_Hm is None:
+                raise RuntimeError("Hb_inv_Hm non inizializzato in modalità reactionless_dyn")
+            v_base_next = -(Hb_inv_Hm @ qd_arm_next)
+        else:
+            v_base_next = np.zeros(6)
 
         v_next = v.copy()
         v_next[0:6] = v_base_next
         for j in range(n_arm):
             v_next[idx_v_arm[j]] = qd_arm_next[j]
-
-        # Accelerazione (solo per diagnostica Pinocchio): base derivata numericamente, braccio = qdd_arm
-        a = np.zeros(model.nv)
-        a[0:6] = (v_base_next - v_base_prev) / dt
-        for j in range(n_arm):
-            a[idx_v_arm[j]] = qdd_arm[j]
-
-        # Accelerazione EE effettiva (Pinocchio) per confronto
-        # Nota: le funzioni getFrameAcceleration/getFrameClassicalAcceleration richiedono che data
-        # contenga anche le accelerazioni (passo `a` a forwardKinematics).
-        pin.forwardKinematics(model, data, q, v, a)
-        pin.updateFramePlacements(model, data)
-        A_sp = pin.getFrameAcceleration(model, data, ee_frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
-        A_cl = pin.getFrameClassicalAcceleration(model, data, ee_frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
-
-        a_lin_spatial = np.array(A_sp.linear).reshape(3)
-        a_lin_classical = np.array(A_cl.linear).reshape(3)
-        a_lin_ref = (a_des + fb)[0:3].copy()
 
         q = pin.integrate(model, q, v_next * dt)
         pin.normalize(model, q)
@@ -531,12 +643,13 @@ def main():
         ee_p_des_log.append(p_des.copy())
         err_pos_log.append(float(np.linalg.norm(e_pos)))
 
-        a_lin_ref_log.append(a_lin_ref)
-        a_lin_class_log.append(a_lin_classical)
-        a_lin_spatial_log.append(a_lin_spatial)
+        react_moment_norm_log.append(react_moment_norm)
 
         if (i % int(rate_hz)) == 0:
-            print(f"t={t:5.2f} | ||e_pos||={np.linalg.norm(e_pos):.4f} | ||qdd||={np.linalg.norm(qdd_arm):.2f}")
+            print(
+                f"t={t:5.2f} | ||e_pos||={np.linalg.norm(e_pos):.4f} | ||qdd||={np.linalg.norm(qdd_arm):.2f} | "
+                f"||H_MR*qdd+n_MR||={react_moment_norm:.3f}"
+            )
 
         now = time.time()
         if have_viz and (i % draw_stride) == 0:
@@ -595,10 +708,7 @@ def main():
         ee_p = np.vstack(ee_p_log)
         ee_p_des = np.vstack(ee_p_des_log)
         err_arr = np.array(err_pos_log)
-
-        a_ref_arr = np.vstack(a_lin_ref_log) if len(a_lin_ref_log) else None
-        a_cl_arr = np.vstack(a_lin_class_log) if len(a_lin_class_log) else None
-        a_sp_arr = np.vstack(a_lin_spatial_log) if len(a_lin_spatial_log) else None
+        react_moment_norm_arr = np.array(react_moment_norm_log, dtype=float) if len(react_moment_norm_log) else None
 
         print("\nDifferenza posizione EE fine-inizio:")
         delta_ee = ee_p[-1, :] - ee_p[0, :]
@@ -619,32 +729,13 @@ def main():
         ax3d.set_title("Traiettoria EE")
         ax3d.legend(loc="best")
 
-        e_ee = ee_p_des - ee_p
-        fig_err, axs = plt.subplots(3, 1, sharex=True)
-        axs[0].plot(t_arr, e_ee[:, 0])
-        axs[0].set_ylabel("e_x [m]")
-        axs[1].plot(t_arr, e_ee[:, 1])
-        axs[1].set_ylabel("e_y [m]")
-        axs[2].plot(t_arr, e_ee[:, 2])
-        axs[2].set_ylabel("e_z [m]")
-        axs[2].set_xlabel("t [s]")
-        fig_err.suptitle("EE: errore (des - reale)")
-        fig_err.tight_layout()
-
-        if a_ref_arr is not None and a_cl_arr is not None and a_sp_arr is not None:
-            fig_acc, axa = plt.subplots(3, 1, sharex=True)
-            labels = ["x", "y", "z"]
-            for k in range(3):
-                axa[k].plot(t_arr, a_ref_arr[:, k], "k--", linewidth=2.0, label="a_ref")
-                axa[k].plot(t_arr, a_cl_arr[:, k], label="a_class")
-                axa[k].plot(t_arr, a_sp_arr[:, k], label="a_spatial")
-                axa[k].set_ylabel(f"a_{labels[k]} [m/s^2]")
-                axa[k].grid(True)
-                if k == 0:
-                    axa[k].legend(loc="best")
-            axa[2].set_xlabel("t [s]")
-            fig_acc.suptitle("EE: accelerazione lineare (ref vs Pinocchio)")
-            fig_acc.tight_layout()
+        if react_moment_norm_arr is not None:
+            fig_rm, ax_rm = plt.subplots(1, 1)
+            ax_rm.plot(t_arr, react_moment_norm_arr, linewidth=2.0)
+            ax_rm.set_xlabel("t [s]")
+            ax_rm.set_ylabel("||H_MR*qdd + n_MR||")
+            ax_rm.set_title("Norma del momento di reazione (proxy)")
+            ax_rm.grid(True)
 
         plt.tight_layout()
         plt.show()
