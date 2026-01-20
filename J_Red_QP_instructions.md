@@ -1,6 +1,6 @@
 # Instructions: QP-based Reaction-Minimizing algorithm for UAM
 
-## Objective
+## First version Objective
 
 Modify `clik_uam_node.cpp` so to control the arm when in redundant mode. In this case I would like to exploit redundancy by asking the arm to track a 2D trajectory with its end-effector (only x-y-z coordinates, without caring about EE orientation) so that at least it has one degree of redundancy. 
 
@@ -20,13 +20,21 @@ No equality constraints are required; joint limits are added later as box constr
 
 ---
 
-## Conceptual Differences w.r.t. Cocuzza et al. (2012)
+## Second version objective
 
-The control algorithm is similar to that presented in the paper in `media/paper-LS.pdf` but with some differences:
+The controller shall compute **joint accelerations** `qdd` by solving, at each control step, the following optimization problem:
 
-* The base is **not free-floating**: it is a drone subject to gravity and control forces.
-* Momentum conservation **does not hold**; reaction minimization is **local** and formulated explicitly in acceleration space.
-* Only the **reaction moment** (not force) is minimized, consistent with aerial platform disturbance sensitivity.
+$$
+\argmin_{\ddot q} \| J\ddot q - \dot{v}_{des} \|_{W_{kin}} +  \| H_{M_R}\ddot q + n_{M_R} \|_{W_{dyn}}
+$$
+
+where:
+
+* $J$ is the **classic Jacobian** mapping joint accelerations to EE acceleration (task space reduced as needed),
+* $\dot{v}_{des}$ is the desired task-space acceleration with feedback terms, $\dot{v}_{des}=\dot{v}_{ref}+ K_P e + K_D \dot{e} - \dot{J}\dot{q}$
+* $H_{M_R}$ is the **reaction-moment inertia submatrix** (rows 3–6) of the **manipulator-only inertia matrix**,
+* $n_{M_R}$ is the corresponding nonlinear term (Coriolis + centrifugal + gravity contribution, consistent with `H_MR`),
+* $λ_W$ = $W_{kin}/W_{dyn}$ is a scalar weight tuning the trade-off between tracking and reaction minimization.
 
 ---
 
