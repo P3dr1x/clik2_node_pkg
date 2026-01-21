@@ -11,6 +11,8 @@
 #include "pinocchio/algorithm/crba.hpp"    // inertia matrix (CRBA)
 #include "pinocchio/algorithm/rnea.hpp"    // nonLinearEffects, gravity, RNEA
 #include "pinocchio/algorithm/centroidal.hpp"
+#include "pinocchio/algorithm/model.hpp"               // buildReducedModel
+#include "pinocchio/algorithm/joint-configuration.hpp" // neutral, normalize
 #include "pinocchio/spatial/se3.hpp" // per SE3 log6
 #include "pinocchio/spatial/explog.hpp" // per log3 su SO(3)
 #include "interbotix_xs_msgs/msg/joint_group_command.hpp" // Include necessario per il nuovo tipo di messaggio
@@ -84,7 +86,34 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
         const std::string urdf_man_filename = pkg_share + "/model/wx250s.urdf";
         RCLCPP_INFO(this->get_logger(), "Caricamento modello manipolatore URDF da: %s", urdf_man_filename.c_str());
         try {
-            pinocchio::urdf::buildModel(urdf_man_filename, pinocchio::JointModelFreeFlyer(), model_man_);
+            // Costruisci il modello completo (include anche gripper e dita), poi riducilo lockando i giunti del gripper.
+            pinocchio::Model model_man_full;
+            pinocchio::urdf::buildModel(urdf_man_filename, pinocchio::JointModelFreeFlyer(), model_man_full);
+
+            // Lock dei giunti gripper (come nello script test_acc_control_QP.py)
+            const std::vector<std::string> gripper_joints = {"gripper", "left_finger", "right_finger"};
+            std::vector<pinocchio::JointIndex> joints_to_lock;
+            joints_to_lock.reserve(gripper_joints.size());
+            for (const auto &jn : gripper_joints) {
+                const pinocchio::JointIndex jid = model_man_full.getJointId(jn);
+                if (jid > 0) {
+                    joints_to_lock.push_back(jid);
+                }
+            }
+
+            if (!joints_to_lock.empty()) {
+                const Eigen::VectorXd q0_lock = pinocchio::neutral(model_man_full);
+                model_man_ = pinocchio::buildReducedModel(model_man_full, joints_to_lock, q0_lock);
+                RCLCPP_INFO(this->get_logger(), "Modello manipolatore ridotto: lockati %zu giunti gripper", joints_to_lock.size());
+            } else {
+                model_man_ = model_man_full;
+                RCLCPP_WARN(this->get_logger(), "Giunti gripper non trovati nel modello manipolatore; uso modello completo");
+            }
+
+            // Richiesta: ignora la gravità nel modello del braccio (n_MR non include il contributo del peso)
+            model_man_.gravity.linear().setZero();
+            model_man_.gravity.angular().setZero();
+
             data_man_ = pinocchio::Data(model_man_);
         } catch (const std::exception &e) {
             RCLCPP_ERROR(this->get_logger(), "Errore nel caricamento del modello manipolatore URDF: %s", e.what());
@@ -213,17 +242,31 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
     // NOTE: dichiarato solo per compatibilità con vecchie config, ma non usato nei vincoli QP
     this->declare_parameter<double>("joint_acc_limit", 30.0);
     this->declare_parameter<double>("lambda_w", 10.0);
-    this->declare_parameter<double>("qp_lambda_reg", 1e-6);
+    this->declare_parameter<double>("w_kin", 10.0);
+    this->declare_parameter<double>("w_dyn", 1.0);
+    this->declare_parameter<double>("qp_lambda_reg", 1e-2);
     k_err_pos_ = get_parameter("k_err_pos_").as_double();
     k_err_vel_ = get_parameter("k_err_vel_").as_double();
     joint_vel_limit_ = this->get_parameter("joint_vel_limit").as_double();
     lambda_w_ = this->get_parameter("lambda_w").as_double();
+    w_kin_ = this->get_parameter("w_kin").as_double();
+    w_dyn_ = this->get_parameter("w_dyn").as_double();
     qp_lambda_reg_ = this->get_parameter("qp_lambda_reg").as_double();
+
+    if (w_kin_ < 0.0) {
+        RCLCPP_WARN(this->get_logger(), "w_kin < 0 non consentito; imposto w_kin=0");
+        w_kin_ = 0.0;
+    }
+    if (w_dyn_ < 0.0) {
+        RCLCPP_WARN(this->get_logger(), "w_dyn < 0 non consentito; imposto w_dyn=0");
+        w_dyn_ = 0.0;
+    }
     K_matrix_ = Eigen::MatrixXd::Identity(6, 6) * k_err_pos_;
     Kd_matrix_ = Eigen::MatrixXd::Identity(6, 6) * k_err_vel_;
 
     // Log iniziale dei guadagni di controllo posizione/velocità EE
     RCLCPP_INFO(this->get_logger(), "Guadagni EE: k_err_pos_=%.3f, k_err_vel_=%.3f", k_err_pos_, k_err_vel_);
+    RCLCPP_INFO(this->get_logger(), "Pesi QP: w_kin=%.3f, w_dyn=%.3f (lambda_w legacy=%.3f)", w_kin_, w_dyn_, lambda_w_);
 
     // Pesi per la pseudoinversa
     this->declare_parameter<double>("shoulder_weight", 15.0);
@@ -801,15 +844,28 @@ void ClikUamNode::update()
 
     Eigen::VectorXd fb = K_matrix_ * error_pose_ee_ + Kd_matrix_ * error_vel_ee_;
     if (redundant_) {
-        fb.tail(3) *= redundant_ang_fb_scale_;
+        // Task 3D: ignoriamo orientazione e feedback angolare
+        fb.tail(3).setZero();
     }
 
     Eigen::VectorXd vdot_des = acc_ee_des + fb - Jdot_v;
 
-    // 8. COSTRUZIONE QP: min 0.5*lambda_w||J*qdd - vdot_des||^2 + 0.5||H_MR*qdd + n_mr||^2
-    qp_v_task_ = vdot_des;
-    for (int i = 0; i < n_arm; ++i) {
-        qp_J_task_.col(i) = J_.col(idx_v_arm_[i]);
+    // 8. COSTRUZIONE QP (come test_acc_control_QP.py):
+    // min_qdd  || Jgen*qdd - vdot_des ||^2_{w_kin} + || H_MR*qdd + n_MR ||^2_{w_dyn}
+    // In modalità redundant: task 3D (solo posizione) -> usa solo le prime 3 righe (lineari).
+    qp_J_task_.setZero();
+    qp_v_task_.setZero();
+    if (redundant_) {
+        // Solo parte lineare (x,y,z)
+        qp_v_task_.head<3>() = vdot_des.head<3>();
+        for (int i = 0; i < n_arm; ++i) {
+            qp_J_task_.col(i).head<3>() = Jgen.col(i).head<3>();
+        }
+    } else {
+        qp_v_task_ = vdot_des;
+        for (int i = 0; i < n_arm; ++i) {
+            qp_J_task_.col(i) = Jgen.col(i);
+        }
     }
 
     // Dinamica manipolatore-only per H_MR e n_mr (righe 3..5: momento base in frame body/LOCAL)
@@ -852,11 +908,13 @@ void ClikUamNode::update()
         qp_H_mr_.col(i) = data_man_.M.block<3, 1>(3, idx_v_arm_man_[i]);
     }
 
-    qp_P_dense_.noalias() = (lambda_w_ * (qp_J_task_.transpose() * qp_J_task_)) + (qp_H_mr_.transpose() * qp_H_mr_);
+    qp_P_dense_.noalias() = (w_kin_ * (qp_J_task_.transpose() * qp_J_task_)) + (w_dyn_ * (qp_H_mr_.transpose() * qp_H_mr_));
     qp_P_dense_.diagonal().array() += qp_lambda_reg_;
     qp_P_dense_ = 0.5 * (qp_P_dense_ + qp_P_dense_.transpose());
 
-    qp_gradient_.noalias() = -((lambda_w_ * (qp_J_task_.transpose() * qp_v_task_)) - (qp_H_mr_.transpose() * qp_n_mr_));
+    // OSQP-Eigen usa forma 0.5 x^T P x + g^T x
+    // => g = w_dyn * H^T n - w_kin * J^T v
+    qp_gradient_.noalias() = (w_dyn_ * (qp_H_mr_.transpose() * qp_n_mr_)) - (w_kin_ * (qp_J_task_.transpose() * qp_v_task_));
 
     // 9. Vincoli box su qdd (derivati da limiti vel/pos discretizzati)
     const double inf = std::numeric_limits<double>::infinity();

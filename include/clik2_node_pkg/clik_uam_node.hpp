@@ -20,6 +20,8 @@
 #include "geometry_msgs/msg/transform_stamped.hpp" 
 #include "pinocchio/multibody/model.hpp"
 #include "pinocchio/multibody/data.hpp"
+#include "pinocchio/algorithm/model.hpp"               // buildReducedModel
+#include "pinocchio/algorithm/joint-configuration.hpp" // neutral, normalize
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <OsqpEigen/OsqpEigen.h>
@@ -128,6 +130,10 @@ private:
 
     // Trade-off tracking vs reaction-moment minimization (lambda_W = W_kin/W_dyn)
     double lambda_w_ = 10.0;
+
+    // Pesi separati del costo (come script test_acc_control_QP.py)
+    double w_kin_ = 10.0;
+    double w_dyn_ = 1.0;
 
     // QP regularization
     double qp_lambda_reg_ = 1e-6;
