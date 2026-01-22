@@ -98,6 +98,8 @@ private:
     // Pinocchio model for the manipulator only (FreeFlyer + arm) used for reaction-moment minimization
     pinocchio::Model model_man_;
     pinocchio::Data data_man_;
+    pinocchio::FrameIndex ee_frame_id_man_;
+    bool have_ee_frame_man_ = false;
     std::vector<int> idx_v_arm_man_;
     std::vector<int> idx_q_arm_man_;
 
@@ -136,7 +138,7 @@ private:
     double w_dyn_ = 1.0;
 
     // QP regularization
-    double qp_lambda_reg_ = 1e-6;
+    double qp_lambda_reg_ = 1e-2;
 
     // Flag e timestamp per gestione messaggi desiderati
     bool desired_ee_accel_ready_ = false;

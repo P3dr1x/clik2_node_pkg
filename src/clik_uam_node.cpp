@@ -149,6 +149,18 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
         q_man_.setZero();
         v_man_.resize(model_man_.nv);
         v_man_.setZero();
+
+        // Frame end-effector nel modello manipolatore (usato per Jacobiano classico del braccio)
+        if (model_man_.existFrame("mobile_wx250s/ee_gripper_link")) {
+            ee_frame_id_man_ = model_man_.getFrameId("mobile_wx250s/ee_gripper_link");
+            have_ee_frame_man_ = true;
+        } else if (model_man_.existFrame("ee_gripper_link")) {
+            ee_frame_id_man_ = model_man_.getFrameId("ee_gripper_link");
+            have_ee_frame_man_ = true;
+        } else {
+            have_ee_frame_man_ = false;
+            RCLCPP_WARN(this->get_logger(), "Frame EE non trovato in model_man_ (wx250s.urdf). Userò lo Jacobiano del modello completo come fallback.");
+        }
     }
 
     // SOTTOSCRIZIONI STATO DRONE
@@ -242,7 +254,7 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
     // NOTE: dichiarato solo per compatibilità con vecchie config, ma non usato nei vincoli QP
     this->declare_parameter<double>("joint_acc_limit", 30.0);
     this->declare_parameter<double>("lambda_w", 10.0);
-    this->declare_parameter<double>("w_kin", 10.0);
+    this->declare_parameter<double>("w_kin", 1.0);
     this->declare_parameter<double>("w_dyn", 1.0);
     this->declare_parameter<double>("qp_lambda_reg", 1e-2);
     k_err_pos_ = get_parameter("k_err_pos_").as_double();
@@ -836,9 +848,64 @@ void ClikUamNode::update()
     error_vel_ee_ = v_ee_des - v_ee_meas;
 
 
+    // === Stato manipolatore-only (base = mobile_wx250s/base_link) ===
+    // Serve per: (1) Jacobiano classico del braccio nel costo cinematico (J),
+    //            (2) H_MR e n_MR nel costo dinamico.
+    q_man_.setZero();
+    v_man_.setZero();
+
+    // Posa di O (mobile_wx250s/base_link) nel mondo dal modello completo
+    const pinocchio::SE3 &T_w_O = data_.oMf[arm_base_frame_id_full_];
+    q_man_.segment<3>(0) = T_w_O.translation();
+    Eigen::Quaterniond q_O(T_w_O.rotation());
+    q_O.normalize();
+    q_man_[3] = q_O.x();
+    q_man_[4] = q_O.y();
+    q_man_[5] = q_O.z();
+    q_man_[6] = q_O.w();
+
+    // Copia posizioni giunti braccio (ordine arm_joints_)
+    for (int i = 0; i < n_arm; ++i) {
+        q_man_[idx_q_arm_man_[i]] = q_arm_meas[i];
+    }
+
+    // Twist della base del braccio (LOCAL di O) dal modello completo
+    const pinocchio::Motion V_O_local = pinocchio::getFrameVelocity(
+        model_, data_, arm_base_frame_id_full_, pinocchio::ReferenceFrame::LOCAL);
+    v_man_.segment<3>(0) = V_O_local.linear();
+    v_man_.segment<3>(3) = V_O_local.angular();
+
+    // Copia velocità giunti braccio
+    for (int i = 0; i < n_arm; ++i) {
+        v_man_[idx_v_arm_man_[i]] = v_gen_meas[idx_v_arm_[i]];
+    }
+    pinocchio::normalize(model_man_, q_man_);
+
+    // Jacobiano del manipolatore (solo colonne dei giunti arm) per il costo cinematico
+    Eigen::Matrix<double, 6, Eigen::Dynamic> J_arm(6, n_arm);
+    J_arm.setZero();
+    if (have_ee_frame_man_) {
+        Eigen::Matrix<double, 6, Eigen::Dynamic> Jm_full(6, model_man_.nv);
+        Jm_full.setZero();
+        pinocchio::computeFrameJacobian(
+            model_man_, data_man_, q_man_, ee_frame_id_man_,
+            pinocchio::ReferenceFrame::LOCAL_WORLD_ALIGNED, Jm_full);
+        for (int i = 0; i < n_arm; ++i) {
+            J_arm.col(i) = Jm_full.col(idx_v_arm_man_[i]);
+        }
+    } else {
+        // Fallback: estrai Jacobiano dei soli giunti arm dal modello completo
+        for (int i = 0; i < n_arm; ++i) {
+            J_arm.col(i) = J_.col(idx_v_arm_[i]);
+        }
+    }
+
+
     // 7. CALCOLO vdot_des (task accel) secondo istruzioni: vdot_des = xdd_ref + Kp*e + Kd*e_dot - Jdot*v
+    // Nota: qui manteniamo il termine -Jdot*v del modello completo (con base free-flyer) come nel codice precedente.
     pinocchio::computeJointJacobiansTimeVariation(model_, data_, q_, v_gen_meas);
     Eigen::Matrix<double, 6, Eigen::Dynamic> Jdot(6, model_.nv);
+    Jdot.setZero();
     pinocchio::getFrameJacobianTimeVariation(model_, data_, ee_frame_id_, pinocchio::ReferenceFrame::LOCAL_WORLD_ALIGNED, Jdot);
     const Eigen::VectorXd Jdot_v = Jdot * v_gen_meas;
 
@@ -851,7 +918,7 @@ void ClikUamNode::update()
     Eigen::VectorXd vdot_des = acc_ee_des + fb - Jdot_v;
 
     // 8. COSTRUZIONE QP (come test_acc_control_QP.py):
-    // min_qdd  || Jgen*qdd - vdot_des ||^2_{w_kin} + || H_MR*qdd + n_MR ||^2_{w_dyn}
+    // min_qdd  || J*qdd - vdot_des ||^2_{w_kin} + || H_MR*qdd + n_MR ||^2_{w_dyn}
     // In modalità redundant: task 3D (solo posizione) -> usa solo le prime 3 righe (lineari).
     qp_J_task_.setZero();
     qp_v_task_.setZero();
@@ -859,12 +926,12 @@ void ClikUamNode::update()
         // Solo parte lineare (x,y,z)
         qp_v_task_.head<3>() = vdot_des.head<3>();
         for (int i = 0; i < n_arm; ++i) {
-            qp_J_task_.col(i).head<3>() = Jgen.col(i).head<3>();
+            qp_J_task_.col(i).head<3>() = J_arm.col(i).head<3>();
         }
     } else {
         qp_v_task_ = vdot_des;
         for (int i = 0; i < n_arm; ++i) {
-            qp_J_task_.col(i) = Jgen.col(i);
+            qp_J_task_.col(i) = J_arm.col(i);
         }
     }
 
