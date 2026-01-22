@@ -137,6 +137,10 @@ private:
     double w_kin_ = 10.0;
     double w_dyn_ = 1.0;
 
+    // Damping in accelerazione (per evitare drift nel nullspace)
+    double w_damp_ = 0.0;
+    double k_damp_ = 0.0;
+
     // QP regularization
     double qp_lambda_reg_ = 1e-2;
 

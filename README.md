@@ -63,7 +63,7 @@ If no or invalid input is given by the user, the desired relative EE pose comman
 For running the controller 
 
 ```bash
-ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=50.0 -p k_err_vel_:=50.0 -p control_rate_hz:=100.0 -p redundant:=false -p lambda_w:=1.0 -p redundant_ang_fb_scale_:=1.0
+ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=50.0 -p k_err_vel_:=50.0 -p control_rate_hz:=120.0 -p redundant:=true -p w_kin:=1.0 -p w_dyn:=1.0 -p qp_lambda_reg:=1e-2 -p w_damp:=0.2 -p k_damp:=2.0
 ```
 
 
@@ -87,7 +87,8 @@ Parameter      |Default value |   Description    |
 | `control_rate_hz` | `100.0` | Frequency at which the `update()` loop of the controller node will operate.
 | `<joint_name>_weight` | `15.0`, `25.0` | Set the weight of the specific joint. This influences the weight matrix used in the weighted pseudoinversion. You can choose `shoulder`, `forearm_roll`, `wrist_rotate` joints.
 |`lambda_w` | `10.0` | Sets if to give priority to trajectory tracking or to reaction torque minimization. If `lambda_w>1.0` you give more priority to trajectory tracking while if `0.0<lambda_w<1.0`.
-
+|`w_kin`, `w_dyn`, `w_damp`| `1.0`, `1.0`, `0.2`| These are the weights that can be used to set tasks priority
+|`k_damp`| `2.0` | Is the proportional gain for damping task
 
 ## Usage with real system (Motion Capture)
 
@@ -121,7 +122,7 @@ This should also open a Rviz session where it is possible to visualize the confi
 
 6. Run the controller
 ```bash
-ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=50.0 -p k_err_vel_:=50.0 -p control_rate_hz:=100.0 -p redundant:=false -p lambda_w:=1.0 -p redundant_ang_fb_scale_:=1.0
+ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=50.0 -p k_err_vel_:=50.0 -p control_rate_hz:=120.0 -p redundant:=true -p w_kin:=1.0 -p w_dyn:=1.0 -p qp_lambda_reg:=1e-2 -p w_damp:=0.2 -p k_damp:=2.0
 ```
 7. Run the planner
 ```bash
@@ -135,7 +136,7 @@ ros2 run clik2_node_pkg planner
 The controller computes **joint accelerations** $\ddot{\mathbf{q}}$ by solving, at each control step, the following optimization problem:
 
 $$
-\ddot{\mathbf{q}} = \text{argmin} \| [\mathbf{J}_{gen}]\ddot{\mathbf{q}} - \dot{\mathbf{v}}_{des} \|_{W_{kin}} +  \| [\mathbf{H}_{M_R}]\ddot{\mathbf{q}} + \mathbf{n}_{M_R} \|_{W_{dyn}}
+\ddot{\mathbf{q}} = \text{argmin} \| [\mathbf{J}_{gen}]\ddot{\mathbf{q}} - \dot{\mathbf{v}}_{des} \|_{W_{kin}} +  \| [\mathbf{H}_{M_R}]\ddot{\mathbf{q}} + \mathbf{n}_{M_R} \|_{W_{dyn}} + \|\ddot{\mathbf{q}} + k_d \dot{\mathbf{q}}\|_{{W}_{damp}}
 $$
 
 where:
@@ -144,7 +145,7 @@ where:
 * $\dot{\mathbf{v}}_{des}$ is the desired task-space acceleration with feedback terms,
 * $\mathbf{H}_{M_R}$ is the **reaction-moment inertia submatrix** (rows 3–6) of the **manipulator-only inertia matrix**,
 * $\mathbf{n}_{M_R}$ is the corresponding nonlinear term (Coriolis + centrifugal + gravity contribution, consistent with $\mathbf{H}_{M_R}$),
-* $λ_W$ = $W_{kin}/W_{dyn}$ is a scalar weight tuning the trade-off between tracking and reaction minimization.
+* $W_{kin}, W_{dyn}, W_{damp}$ is a scalar weight tuning the trade-off between tracking and reaction minimization.
 
 For more info check the paper (please consider citing):
 

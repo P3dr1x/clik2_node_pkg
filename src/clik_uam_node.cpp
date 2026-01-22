@@ -256,6 +256,8 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
     this->declare_parameter<double>("lambda_w", 10.0);
     this->declare_parameter<double>("w_kin", 1.0);
     this->declare_parameter<double>("w_dyn", 1.0);
+    this->declare_parameter<double>("w_damp", 0.2);
+    this->declare_parameter<double>("k_damp", 2.0);
     this->declare_parameter<double>("qp_lambda_reg", 1e-2);
     k_err_pos_ = get_parameter("k_err_pos_").as_double();
     k_err_vel_ = get_parameter("k_err_vel_").as_double();
@@ -263,6 +265,8 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
     lambda_w_ = this->get_parameter("lambda_w").as_double();
     w_kin_ = this->get_parameter("w_kin").as_double();
     w_dyn_ = this->get_parameter("w_dyn").as_double();
+    w_damp_ = this->get_parameter("w_damp").as_double();
+    k_damp_ = this->get_parameter("k_damp").as_double();
     qp_lambda_reg_ = this->get_parameter("qp_lambda_reg").as_double();
 
     if (w_kin_ < 0.0) {
@@ -273,12 +277,20 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()
         RCLCPP_WARN(this->get_logger(), "w_dyn < 0 non consentito; imposto w_dyn=0");
         w_dyn_ = 0.0;
     }
+    if (w_damp_ < 0.0) {
+        RCLCPP_WARN(this->get_logger(), "w_damp < 0 non consentito; imposto w_damp=0");
+        w_damp_ = 0.0;
+    }
+    if (k_damp_ < 0.0) {
+        RCLCPP_WARN(this->get_logger(), "k_damp < 0 non consentito; imposto k_damp=0");
+        k_damp_ = 0.0;
+    }
     K_matrix_ = Eigen::MatrixXd::Identity(6, 6) * k_err_pos_;
     Kd_matrix_ = Eigen::MatrixXd::Identity(6, 6) * k_err_vel_;
 
     // Log iniziale dei guadagni di controllo posizione/velocità EE
     RCLCPP_INFO(this->get_logger(), "Guadagni EE: k_err_pos_=%.3f, k_err_vel_=%.3f", k_err_pos_, k_err_vel_);
-    RCLCPP_INFO(this->get_logger(), "Pesi QP: w_kin=%.3f, w_dyn=%.3f (lambda_w legacy=%.3f)", w_kin_, w_dyn_, lambda_w_);
+    RCLCPP_INFO(this->get_logger(), "Pesi QP: w_kin=%.3f, w_dyn=%.3f, w_damp=%.3f (k_damp=%.3f)", w_kin_, w_dyn_, w_damp_, k_damp_);
 
     // Pesi per la pseudoinversa
     this->declare_parameter<double>("shoulder_weight", 15.0);
@@ -936,36 +948,6 @@ void ClikUamNode::update()
     }
 
     // Dinamica manipolatore-only per H_MR e n_mr (righe 3..5: momento base in frame body/LOCAL)
-    q_man_.setZero();
-    v_man_.setZero();
-    // NOTA: la base del manipolatore-only corrisponde a mobile_wx250s/base_link (non al link base del drone)
-    // Posa di O (mobile_wx250s/base_link) nel mondo dal modello completo
-    const pinocchio::SE3 &T_w_O = data_.oMf[arm_base_frame_id_full_];
-    q_man_.segment<3>(0) = T_w_O.translation();
-    Eigen::Quaterniond q_O(T_w_O.rotation());
-    q_O.normalize();
-    q_man_[3] = q_O.x();
-    q_man_[4] = q_O.y();
-    q_man_[5] = q_O.z();
-    q_man_[6] = q_O.w();
-
-    // Copia posizioni giunti braccio (ordine arm_joints_)
-    for (int i = 0; i < n_arm; ++i) {
-        q_man_[idx_q_arm_man_[i]] = q_arm_meas[i];
-    }
-
-    // Twist della base del braccio (LOCAL di O) dal modello completo
-    const pinocchio::Motion V_O_local = pinocchio::getFrameVelocity(
-        model_, data_, arm_base_frame_id_full_, pinocchio::ReferenceFrame::LOCAL);
-    v_man_.segment<3>(0) = V_O_local.linear();
-    v_man_.segment<3>(3) = V_O_local.angular();
-
-    // Copia velocità giunti braccio
-    for (int i = 0; i < n_arm; ++i) {
-        v_man_[idx_v_arm_man_[i]] = v_gen_meas[idx_v_arm_[i]];
-    }
-    pinocchio::normalize(model_man_, q_man_);
-
     pinocchio::crba(model_man_, data_man_, q_man_);
     data_man_.M.triangularView<Eigen::StrictlyLower>() = data_man_.M.transpose().triangularView<Eigen::StrictlyLower>();
     pinocchio::nonLinearEffects(model_man_, data_man_, q_man_, v_man_);
@@ -982,6 +964,13 @@ void ClikUamNode::update()
     // OSQP-Eigen usa forma 0.5 x^T P x + g^T x
     // => g = w_dyn * H^T n - w_kin * J^T v
     qp_gradient_.noalias() = (w_dyn_ * (qp_H_mr_.transpose() * qp_n_mr_)) - (w_kin_ * (qp_J_task_.transpose() * qp_v_task_));
+
+    // Damping task (accelerazione): min 0.5*w_damp*|| qdd + k_damp*qd ||^2
+    // Contribuisce a fermare il moto residuo e riduce il drift nel nullspace verso i limiti.
+    if (w_damp_ > 0.0 && k_damp_ > 0.0) {
+        qp_P_dense_.diagonal().array() += w_damp_;
+        qp_gradient_.noalias() += (w_damp_ * k_damp_) * qd_arm_meas;
+    }
 
     // 9. Vincoli box su qdd (derivati da limiti vel/pos discretizzati)
     const double inf = std::numeric_limits<double>::infinity();
