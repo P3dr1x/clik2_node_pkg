@@ -1,8 +1,6 @@
 #include "clik2_node_pkg/clik_uam_node.hpp"
-#include <iostream>
 #include <vector>
 #include <string>
-#include <memory>
 #include <type_traits> // per std::is_convertible_v usato internamente dai macro RCLCPP
 #include "pinocchio/parsers/urdf.hpp"
 #include "pinocchio/algorithm/jacobian.hpp"
@@ -15,22 +13,15 @@
 #include "pinocchio/algorithm/joint-configuration.hpp" // neutral, normalize
 #include "pinocchio/spatial/se3.hpp" // per SE3 log6
 #include "pinocchio/spatial/explog.hpp" // per log3 su SO(3)
-#include "interbotix_xs_msgs/msg/joint_group_command.hpp" // Include necessario per il nuovo tipo di messaggio
 #include "ament_index_cpp/get_package_share_directory.hpp"
-#include "std_msgs/msg/float64_multi_array.hpp"
-#include "geometry_msgs/msg/pose_array.hpp"
-#include "geometry_msgs/msg/pose_stamped.hpp"
-#include <Eigen/SVD>
 #include <Eigen/Dense>
-#include <iomanip>
 #include <algorithm> // std::clamp
-#include <sstream>   // debug formatting
 #include <cmath>     // std::isfinite, std::abs
 #include <chrono>
 #include <limits>
 
 /// @brief 
-ClikUamNode::ClikUamNode() : Node("clik_uam_node"), tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_)
+ClikUamNode::ClikUamNode() : Node("clik_uam_node")
 {
     RCLCPP_INFO(this->get_logger(), "Nodo clik_uam_node avviato.");
 
