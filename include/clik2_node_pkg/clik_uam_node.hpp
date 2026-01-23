@@ -4,7 +4,6 @@
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/pose.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
-#include "visualization_msgs/msg/marker.hpp"
 #include "px4_msgs/msg/vehicle_local_position.hpp"
 #include "px4_msgs/msg/vehicle_attitude.hpp"
 #include "px4_msgs/msg/vehicle_odometry.hpp"
@@ -15,13 +14,8 @@
 #include "geometry_msgs/msg/accel.hpp"
 #include "interbotix_xs_msgs/msg/joint_group_command.hpp"
 #include "nav_msgs/msg/odometry.hpp"
-#include "tf2_ros/buffer.h"
-#include "tf2_ros/transform_listener.h"
-#include "geometry_msgs/msg/transform_stamped.hpp" 
 #include "pinocchio/multibody/model.hpp"
 #include "pinocchio/multibody/data.hpp"
-#include "pinocchio/algorithm/model.hpp"               // buildReducedModel
-#include "pinocchio/algorithm/joint-configuration.hpp" // neutral, normalize
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <OsqpEigen/OsqpEigen.h>
@@ -51,7 +45,6 @@ private:
     // Variabili membro
     geometry_msgs::msg::Pose desired_ee_pose_world_;
     geometry_msgs::msg::Twist desired_ee_velocity_world_;
-    Eigen::VectorXd desired_ee_velocity_vec_;
     geometry_msgs::msg::Accel desired_ee_accel_world_;
     bool desired_ee_pose_world_ready_ = false;
     bool desired_ee_velocity_ready_ = false;
@@ -82,10 +75,6 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr desired_ee_velocity_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Accel>::SharedPtr desired_ee_accel_sub_;
 
-    tf2_ros::Buffer tf_buffer_;
-    tf2_ros::TransformListener tf_listener_;
-    // tf_broadcaster_ rimosso: non utilizzato in questo nodo
-
     // Pinocchio model and data
     pinocchio::Model model_;
     pinocchio::Data data_;
@@ -110,9 +99,6 @@ private:
     bool have_position_limits_ = false;
     bool have_velocity_limits_ = false;
 
-    // Sottomatrici della Centroidal Momentum Matrix (Ag)
-    Eigen::MatrixXd Ag_b_; // 6x6
-    Eigen::MatrixXd Ag_m_; // 6xm (m = nv - 6)
     Eigen::VectorXd q_;
     Eigen::VectorXd qd_;
     Eigen::VectorXd error_pose_ee_;
@@ -185,16 +171,6 @@ private:
     Eigen::VectorXd q_pos_int_; // posizione integrata (totale)
     Eigen::VectorXd qd_int_; // velocità integrata (totale)
     bool accel_buffers_initialized_ = false;
-
-    // Stima velocità EE da differenziazione
-    geometry_msgs::msg::Pose last_ee_pose_world_;
-    rclcpp::Time last_ee_time_;
-    bool have_last_ee_ = false;
-
-    // Stima twist base (drone) da differenziazione
-    geometry_msgs::msg::Pose last_drone_pose_world_;
-    rclcpp::Time last_drone_time_;
-    bool have_last_drone_ = false;
 
     // Contatore delle iterazioni dell'update dopo il superamento della guardia
     std::size_t update_iterations_after_guard_ = 0;
