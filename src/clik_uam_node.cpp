@@ -369,9 +369,10 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node")
         qp_J_task_.setZero();
         qp_v_task_.resize(6);
         qp_v_task_.setZero();
-        qp_H_mr_.resize(3, qp_n_);
+        // Termine di reazione (wrench base manipolatore-only): [forza; momento]
+        qp_H_mr_.resize(6, qp_n_);
         qp_H_mr_.setZero();
-        qp_n_mr_.resize(3);
+        qp_n_mr_.resize(6);
         qp_n_mr_.setZero();
 
         // A = I (box constraints)
@@ -909,7 +910,7 @@ void ClikUamNode::update()
         }
     }
 
-    // Dinamica manipolatore-only per H_MR e n_mr (righe 3..5: momento base in frame LOCAL della base del braccio)
+    // Dinamica manipolatore-only per H_MR e n_mr (righe 0..5: wrench base = [forza; momento] in frame body/LOCAL)
     // NOTA: la base del manipolatore-only corrisponde a mobile_wx250s/base_link (non al link base del drone).
     q_man_.setZero();
     v_man_.setZero();
@@ -942,14 +943,15 @@ void ClikUamNode::update()
 
     pinocchio::normalize(model_man_, q_man_);
 
-    // Dinamica manipolatore-only per H_MR e n_mr (righe 3..5: momento base in frame body/LOCAL)
+    // Dinamica manipolatore-only per H_MR e n_mr (righe 0..5: wrench base in frame body/LOCAL)
     pinocchio::crba(model_man_, data_man_, q_man_);
     data_man_.M.triangularView<Eigen::StrictlyLower>() = data_man_.M.transpose().triangularView<Eigen::StrictlyLower>();
     pinocchio::nonLinearEffects(model_man_, data_man_, q_man_, v_man_);
 
-    qp_n_mr_ = data_man_.nle.segment<3>(3);
+    // Reazione sulla base (FreeFlyer) del manipolatore-only: [forza; momento]
+    qp_n_mr_ = data_man_.nle.segment<6>(0);
     for (int i = 0; i < n_arm; ++i) {
-        qp_H_mr_.col(i) = data_man_.M.block<3, 1>(3, idx_v_arm_man_[i]);
+        qp_H_mr_.col(i) = data_man_.M.block<6, 1>(0, idx_v_arm_man_[i]);
     }
 
     qp_P_dense_.noalias() = (w_kin_ * (qp_J_task_.transpose() * qp_J_task_)) + (w_dyn_ * (qp_H_mr_.transpose() * qp_H_mr_));

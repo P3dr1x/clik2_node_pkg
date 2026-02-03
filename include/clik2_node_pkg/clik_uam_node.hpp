@@ -191,8 +191,10 @@ private:
     Eigen::MatrixXd qp_P_dense_;
     Eigen::MatrixXd qp_J_task_;   // 6 x n
     Eigen::VectorXd qp_v_task_;   // 6
-    Eigen::MatrixXd qp_H_mr_;     // 3 x n
-    Eigen::VectorXd qp_n_mr_;     // 3
+    // Termine dinamico di reazione (wrench sulla base FreeFlyer del manipolatore-only): [forza; momento]
+    // NOTA: l'ordine Pinocchio e' sempre [lin; ang]. Il nome *_mr_ e' mantenuto per compatibilita' storica.
+    Eigen::MatrixXd qp_H_mr_;     // 6 x n
+    Eigen::VectorXd qp_n_mr_;     // 6
 
     // Buffer per Jacobiano generalizzato (stima di Jgen_dot via differenze finite)
     Eigen::MatrixXd Jgen_prev_;   // 6 x n_arm
