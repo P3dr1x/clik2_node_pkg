@@ -119,6 +119,15 @@ private:
     double w_kin_ = 10.0;
     double w_dyn_ = 1.0;
 
+    // Peso del task di minimizzazione accelerazione CoM manipolatore-only:
+    // min || J_com_arm * qdd_arm + d/dt(J_com_arm) * qd_arm ||^2
+    double w_com_ = 0.0;
+
+    // Guadagno del termine di smorzamento sulla velocità del CoM (via accelerazione):
+    // min || J_com_arm*qdd_arm + d/dt(J_com_arm)*qd_arm + k_com_vel * v_com_arm ||^2
+    // con v_com_arm ~= J_com_arm * qd_arm (solo contributo dei giunti del braccio).
+    double k_com_vel_ = 0.0;
+
     // Damping in accelerazione (per evitare drift nel nullspace)
     double w_damp_ = 0.0;
     double k_damp_ = 0.0;
@@ -199,6 +208,10 @@ private:
     // Buffer per Jacobiano generalizzato (stima di Jgen_dot via differenze finite)
     Eigen::MatrixXd Jgen_prev_;   // 6 x n_arm
     bool have_Jgen_prev_ = false;
+
+    // Buffer per Jacobiano CoM manipolatore-only (stima di Jcom_dot via differenze finite)
+    Eigen::MatrixXd Jcom_arm_prev_; // 3 x n_arm
+    bool have_Jcom_prev_ = false;
 
     // State buffers for manipulator-only dynamics
     Eigen::VectorXd q_man_;

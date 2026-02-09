@@ -9,6 +9,7 @@
 #include "pinocchio/algorithm/crba.hpp"    // inertia matrix (CRBA)
 #include "pinocchio/algorithm/rnea.hpp"    // nonLinearEffects, gravity, RNEA
 #include "pinocchio/algorithm/centroidal.hpp"
+#include "pinocchio/algorithm/center-of-mass.hpp"
 #include "pinocchio/algorithm/model.hpp"               // buildReducedModel
 #include "pinocchio/algorithm/joint-configuration.hpp" // neutral, normalize
 #include "pinocchio/spatial/se3.hpp" // per SE3 log6
@@ -235,6 +236,8 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node")
     this->declare_parameter<double>("lambda_w", 10.0);
     this->declare_parameter<double>("w_kin", 10.0);
     this->declare_parameter<double>("w_dyn", 1.0);
+    this->declare_parameter<double>("w_com", 0.0);
+    this->declare_parameter<double>("k_com_vel", 2.0);
     this->declare_parameter<double>("w_damp", 0.2);
     this->declare_parameter<double>("k_damp", 2.0);
     this->declare_parameter<double>("qp_lambda_reg", 1e-2);
@@ -244,6 +247,8 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node")
     lambda_w_ = this->get_parameter("lambda_w").as_double();
     w_kin_ = this->get_parameter("w_kin").as_double();
     w_dyn_ = this->get_parameter("w_dyn").as_double();
+    w_com_ = this->get_parameter("w_com").as_double();
+    k_com_vel_ = this->get_parameter("k_com_vel").as_double();
     w_damp_ = this->get_parameter("w_damp").as_double();
     k_damp_ = this->get_parameter("k_damp").as_double();
     qp_lambda_reg_ = this->get_parameter("qp_lambda_reg").as_double();
@@ -256,9 +261,17 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node")
         RCLCPP_WARN(this->get_logger(), "w_dyn < 0 non consentito; imposto w_dyn=0");
         w_dyn_ = 0.0;
     }
+    if (w_com_ < 0.0) {
+        RCLCPP_WARN(this->get_logger(), "w_com < 0 non consentito; imposto w_com=0");
+        w_com_ = 0.0;
+    }
     if (w_damp_ < 0.0) {
         RCLCPP_WARN(this->get_logger(), "w_damp < 0 non consentito; imposto w_damp=0");
         w_damp_ = 0.0;
+    }
+    if (k_com_vel_ < 0.0) {
+        RCLCPP_WARN(this->get_logger(), "k_com_vel < 0 non consentito; imposto k_com_vel=0");
+        k_com_vel_ = 0.0;
     }
     if (k_damp_ < 0.0) {
         RCLCPP_WARN(this->get_logger(), "k_damp < 0 non consentito; imposto k_damp=0");
@@ -269,7 +282,8 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node")
 
     // Log iniziale dei guadagni di controllo posizione/velocità EE
     RCLCPP_INFO(this->get_logger(), "Guadagni EE: k_err_pos_=%.3f, k_err_vel_=%.3f", k_err_pos_, k_err_vel_);
-    RCLCPP_INFO(this->get_logger(), "Pesi QP: w_kin=%.3f, w_dyn=%.3f, w_damp=%.3f (k_damp=%.3f)", w_kin_, w_dyn_, w_damp_, k_damp_);
+    RCLCPP_INFO(this->get_logger(), "Pesi QP: w_kin=%.3f, w_dyn=%.3f, w_com=%.3f (k_com_vel=%.3f), w_damp=%.3f (k_damp=%.3f)",
+                w_kin_, w_dyn_, w_com_, k_com_vel_, w_damp_, k_damp_);
 
     // Pesi per la pseudoinversa
     this->declare_parameter<double>("shoulder_weight", 15.0);
@@ -894,6 +908,7 @@ void ClikUamNode::update()
 
     // 8. COSTRUZIONE QP (come test_acc_control_QP.py):
     // min_qdd  || Jgen*qdd - vdot_des ||^2_{w_kin} + || H_MR*qdd + n_MR ||^2_{w_dyn}
+    //        + || Jcom_arm*qdd + d/dt(Jcom_arm)*qd ||^2_{w_com}
     // In modalità redundant: task 3D (solo posizione) -> usa solo le prime 3 righe (lineari).
     qp_J_task_.setZero();
     qp_v_task_.setZero();
@@ -948,6 +963,40 @@ void ClikUamNode::update()
     data_man_.M.triangularView<Eigen::StrictlyLower>() = data_man_.M.transpose().triangularView<Eigen::StrictlyLower>();
     pinocchio::nonLinearEffects(model_man_, data_man_, q_man_, v_man_);
 
+    // Task CoM (manipolatore-only): minimizza accelerazione del CoM
+    // a_com ~= Jcom_arm*qdd_arm + d/dt(Jcom_arm)*qd_arm
+    Eigen::MatrixXd Jcom_arm(3, n_arm);
+    Jcom_arm.setZero();
+    Eigen::Vector3d Jcom_dot_qd = Eigen::Vector3d::Zero();
+    Eigen::Vector3d vcom_arm = Eigen::Vector3d::Zero();
+    if (w_com_ > 0.0) {
+        pinocchio::forwardKinematics(model_man_, data_man_, q_man_, v_man_);
+        pinocchio::centerOfMass(model_man_, data_man_, q_man_, v_man_, false);
+
+        const Eigen::MatrixXd Jcom_all = pinocchio::jacobianCenterOfMass(model_man_, data_man_, q_man_, false); // 3 x nv_man
+        for (int i = 0; i < n_arm; ++i) {
+            const int iv_man = idx_v_arm_man_[i];
+            if (iv_man >= 0 && iv_man < Jcom_all.cols()) {
+                Jcom_arm.col(i) = Jcom_all.col(iv_man);
+            } else {
+                Jcom_arm.col(i).setZero();
+            }
+        }
+
+        if (have_Jcom_prev_) {
+            if (dt > 0.0) {
+                const Eigen::MatrixXd Jcom_dot = (Jcom_arm - Jcom_arm_prev_) / dt;
+                Jcom_dot_qd.noalias() = Jcom_dot * qd_arm_meas;
+            }
+        } else {
+            have_Jcom_prev_ = true;
+        }
+        Jcom_arm_prev_ = Jcom_arm;
+
+        // Velocità CoM dovuta ai soli giunti del braccio (stesso frame di Jcom_arm)
+        vcom_arm.noalias() = Jcom_arm * qd_arm_meas;
+    }
+
     // Reazione sulla base (FreeFlyer) del manipolatore-only: [forza; momento]
     qp_n_mr_ = data_man_.nle.segment<6>(0);
     for (int i = 0; i < n_arm; ++i) {
@@ -955,12 +1004,18 @@ void ClikUamNode::update()
     }
 
     qp_P_dense_.noalias() = (w_kin_ * (qp_J_task_.transpose() * qp_J_task_)) + (w_dyn_ * (qp_H_mr_.transpose() * qp_H_mr_));
+    if (w_com_ > 0.0) {
+        qp_P_dense_.noalias() += (w_com_ * (Jcom_arm.transpose() * Jcom_arm));
+    }
     qp_P_dense_.diagonal().array() += qp_lambda_reg_;
     qp_P_dense_ = 0.5 * (qp_P_dense_ + qp_P_dense_.transpose());
 
     // OSQP-Eigen usa forma 0.5 x^T P x + g^T x
     // => g = w_dyn * H^T n - w_kin * J^T v
     qp_gradient_.noalias() = (w_dyn_ * (qp_H_mr_.transpose() * qp_n_mr_)) - (w_kin_ * (qp_J_task_.transpose() * qp_v_task_));
+    if (w_com_ > 0.0) {
+        qp_gradient_.noalias() += (w_com_ * (Jcom_arm.transpose() * (Jcom_dot_qd + k_com_vel_ * vcom_arm)));
+    }
 
     // Damping task (accelerazione): min 0.5*w_damp*|| qdd + k_damp*qd ||^2
     // Contribuisce a fermare il moto residuo e riduce il drift nel nullspace verso i limiti.
