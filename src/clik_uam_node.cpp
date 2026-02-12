@@ -14,6 +14,7 @@
 #include "pinocchio/algorithm/joint-configuration.hpp" // neutral, normalize
 #include "pinocchio/spatial/se3.hpp" // per SE3 log6
 #include "pinocchio/spatial/explog.hpp" // per log3 su SO(3)
+#include "pinocchio/fwd.hpp"
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include <Eigen/Dense>
 #include <algorithm> // std::clamp
