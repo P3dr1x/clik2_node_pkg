@@ -122,7 +122,7 @@ This should also open a Rviz session where it is possible to visualize the confi
 
 6. Run the controller
 ```bash
-ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=50.0 -p k_err_vel_:=50.0 -p control_rate_hz:=120.0 -p redundant:=true -p w_kin:=1.0 -p w_dyn:=1.0 -p qp_lambda_reg:=1e-2 -p w_damp:=0.2 -p k_damp:=2.0
+ros2 run clik2_node_pkg clik_uam_node --ros-args -p use_gazebo_pose:=false -p real_system:=true -p k_err_pos_:=50.0 -p k_err_vel_:=50.0 -p control_rate_hz:=120.0 -p redundant:=true -p w_kin:=1.0 -p w_dyn:=0.0 -p qp_lambda_reg:=1e-2 -p w_damp:=0.2 -p k_damp:=2.0 -p w_com:=0.0
 ```
 7. Run the planner
 ```bash
