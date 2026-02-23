@@ -287,7 +287,7 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node")
                 w_kin_, w_dyn_, w_com_, k_com_vel_, w_damp_, k_damp_);
 
     // Pesi per la pseudoinversa
-    this->declare_parameter<double>("shoulder_weight", 15.0);
+    this->declare_parameter<double>("shoulder_weight", 25.0);
     this->declare_parameter<double>("forearm_weight", 25.0);
     this->declare_parameter<double>("wrist_weight", 25.0);
     double shoulder_w = get_parameter("shoulder_weight").as_double();
