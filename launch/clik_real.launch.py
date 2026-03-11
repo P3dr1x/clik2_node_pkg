@@ -144,7 +144,12 @@ def generate_launch_description():
         executable='real_drone_vel_pub',
         name='real_drone_vel_pub',
         output='screen',
-        #parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+        parameters=[
+            {'use_sim_time': LaunchConfiguration('use_sim_time')},
+            # Default: filtra la velocità angolare da PX4 (stabilizza il controller)
+            {'use_mocap_omega': False},
+            {'omega_lp_tau': 0.05},
+        ],
         condition=IfCondition(real_system)
     )
 

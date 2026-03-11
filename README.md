@@ -131,6 +131,40 @@ ros2 run clik2_node_pkg planner
 
 8. Stay safe and enjoy ;)
 
+
+### Angular velocity filtering in the real system
+
+When running on the real platform, the angular velocity published by PX4 on `/fmu/out/vehicle_odometry` can be significantly noisier than in Gazebo simulation. Since `clik_uam_node` uses the UAV twist for feedback, high-frequency noise on the angular velocity may degrade tracking performance and can destabilize the controller.
+
+For this reason, `real_drone_vel_pub` applies a **first-order discrete low-pass filter** to the angular velocity published on `/real_t960a_twist`.
+
+Given the raw angular velocity sample $\boldsymbol{\omega}_{raw,k}$ and the previous filtered value $\boldsymbol{\omega}_{f,k-1}$, the filtered output is computed as
+
+$$
+\boldsymbol{\omega}_{f,k} = \alpha_k \, \boldsymbol{\omega}_{f,k-1} + (1 - \alpha_k) \, \boldsymbol{\omega}_{raw,k}
+$$
+
+with
+
+$$
+\alpha_k = e^{-\Delta t_k / \tau}
+$$
+
+where:
+
+* $\Delta t_k$ is the elapsed time between two consecutive filter updates,
+* $\tau$ is the filter time constant, exposed as the ROS 2 parameter `omega_lp_tau`,
+* $\boldsymbol{\omega}_{f,k}$ is the filtered angular velocity used in `/real_t960a_twist`.
+
+By default, [launch/clik_real.launch.py](launch/clik_real.launch.py) starts `real_drone_vel_pub` with:
+
+* `use_mocap_omega:=false`
+* `omega_lp_tau:=0.05`
+
+so that the node uses PX4 angular velocity as input and publishes its low-pass filtered version.
+
+Optionally, `real_drone_vel_pub` can estimate angular velocity from the `/t960a/pose` quaternion stream by numerical differentiation (`use_mocap_omega:=true`). In that case, the same low-pass filter is still applied before publishing, since quaternion differentiation can also amplify measurement noise.
+
 ## Mathematics
 
 The controller computes **joint accelerations** $\ddot{\mathbf{q}}$ by solving, at each control step, the following optimization problem:
