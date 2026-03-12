@@ -48,6 +48,9 @@ ros2 topic pub --once /commands/joint_group interbotix_xs_msgs/msg/JointGroupCom
   cmd: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 }"
 
+--------- LANCIARE IL NODO CHE FILTRA LA VEL ANGOLARE CON PARAMETRI DA LAUNCH FILE -----------
+
+ros2 launch clik2_node_pkg clik_real.launch.py px4_agent_dev:=/dev/ttyUSB2 use_mocap_omega:=false omega_lp_tau:=0.05
 
 --------- SETTARE I PROFILI DI VELOCITÀ DEI MOTORI ---------------------
 

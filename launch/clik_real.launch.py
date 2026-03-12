@@ -36,6 +36,8 @@ def generate_launch_description():
     # Micro XRCE Agent args (PX4 → ROS 2 bridge over serial)
     px4_agent_dev = LaunchConfiguration('px4_agent_dev', default='/dev/ttyUSB1')
     px4_agent_baud = LaunchConfiguration('px4_agent_baud', default='921600')
+    use_mocap_omega = LaunchConfiguration('use_mocap_omega', default='false')
+    omega_lp_tau = LaunchConfiguration('omega_lp_tau', default='0.05')
 
     # Paths to models
     pkg_share = get_package_share_directory('clik2_node_pkg')  
@@ -147,8 +149,8 @@ def generate_launch_description():
         parameters=[
             {'use_sim_time': LaunchConfiguration('use_sim_time')},
             # Default: filtra la velocità angolare da PX4 (stabilizza il controller)
-            {'use_mocap_omega': False},
-            {'omega_lp_tau': 0.05},
+            {'use_mocap_omega': ParameterValue(use_mocap_omega, value_type=bool)},
+            {'omega_lp_tau': ParameterValue(omega_lp_tau, value_type=float)},
         ],
         condition=IfCondition(real_system)
     )
@@ -185,6 +187,8 @@ def generate_launch_description():
         DeclareLaunchArgument('real_system', default_value='true', choices=['true','false'], description='Se true avvia il nodo real_drone_pose_pub e il broadcaster usa la posa reale.'),
         DeclareLaunchArgument('px4_agent_dev', default_value='/dev/ttyUSB1', description='Dispositivo seriale PX4 (es. /dev/ttyACM0, /dev/ttyUSB1).'),
         DeclareLaunchArgument('px4_agent_baud', default_value='921600', description='Baudrate per MicroXRCEAgent.'),
+        DeclareLaunchArgument('use_mocap_omega', default_value='false', choices=['true', 'false'], description='Se true, real_drone_vel_pub stima la velocità angolare da /t960a/pose invece di usare PX4 odometry.'),
+        DeclareLaunchArgument('omega_lp_tau', default_value='0.05', description='Costante di tempo [s] del filtro passa-basso sulla velocità angolare pubblicata da real_drone_vel_pub.'),
         # Be sure that MicroXRCEAgent is exposing PX4 topic on ROS2
         DeclareLaunchArgument('use_rviz', default_value='false', choices=['true', 'false'], description='Lancia RViz se true.'),
     microxrce_agent,
