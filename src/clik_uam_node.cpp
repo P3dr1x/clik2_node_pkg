@@ -238,6 +238,12 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node")
     this->declare_parameter<double>("w_kin", 10.0);
     this->declare_parameter<double>("w_dyn", 1.0);
     this->declare_parameter<double>("w_com", 0.0);
+    // Soft repulsion from joint limits through barrier functions
+    // Default disabled (w_lim=0.0) to preserve previous behavior.
+    this->declare_parameter<double>("w_lim", 0.0);
+    this->declare_parameter<double>("jlim_gain", 0.05);
+    this->declare_parameter<double>("jlim_margin", 0.3);
+    this->declare_parameter<double>("jlim_eps", 1e-3);
     this->declare_parameter<double>("k_com_vel", 2.0);
     this->declare_parameter<double>("w_damp", 0.2);
     this->declare_parameter<double>("k_damp", 2.0);
@@ -249,6 +255,10 @@ ClikUamNode::ClikUamNode() : Node("clik_uam_node")
     w_kin_ = this->get_parameter("w_kin").as_double();
     w_dyn_ = this->get_parameter("w_dyn").as_double();
     w_com_ = this->get_parameter("w_com").as_double();
+    w_lim_ = this->get_parameter("w_lim").as_double();
+    jlim_gain_ = this->get_parameter("jlim_gain").as_double();
+    jlim_margin_ = this->get_parameter("jlim_margin").as_double();
+    jlim_eps_ = this->get_parameter("jlim_eps").as_double();
     k_com_vel_ = this->get_parameter("k_com_vel").as_double();
     w_damp_ = this->get_parameter("w_damp").as_double();
     k_damp_ = this->get_parameter("k_damp").as_double();
@@ -1023,6 +1033,73 @@ void ClikUamNode::update()
     if (w_damp_ > 0.0 && k_damp_ > 0.0) {
         qp_P_dense_.diagonal().array() += w_damp_;
         qp_gradient_.noalias() += (w_damp_ * k_damp_) * qd_arm_meas;
+    }
+
+    // Soft repulsion from joint limits (barrier functions)
+    // Adds: w_lim * || qdd_arm - qdd_rep(q) ||^2
+    // where qdd_rep is a (gated) descent direction of a log-barrier.
+    {
+        const double w_lim = std::max(0.0, w_lim_);
+        const double margin = std::max(0.0, jlim_margin_);
+        const double eps = std::max(1e-12, jlim_eps_);
+        const double gain = std::max(0.0, jlim_gain_);
+
+        if (w_lim > 0.0 && gain > 0.0 && margin > 0.0 && have_position_limits_) {
+            Eigen::VectorXd qdd_rep(n_arm);
+            qdd_rep.setZero();
+
+            const double inf = std::numeric_limits<double>::infinity();
+            const double dt2 = dt * dt;
+            for (int i = 0; i < n_arm; ++i) {
+                if (!std::isfinite(q_lower_arm_[i]) || !std::isfinite(q_upper_arm_[i])) {
+                    qdd_rep[i] = 0.0;
+                    continue;
+                }
+
+                const double q_i = q_arm_meas[i];
+                const double d_lower = q_i - q_lower_arm_[i];
+                const double d_upper = q_upper_arm_[i] - q_i;
+
+                double term_lower = 0.0;
+                double term_upper = 0.0;
+                if (d_lower < margin) term_lower = 1.0 / std::max(d_lower, eps);
+                if (d_upper < margin) term_upper = 1.0 / std::max(d_upper, eps);
+
+                // Descent direction of: -log(d_lower) - log(d_upper)
+                // qdd_rep = gain * (1/d_lower - 1/d_upper) (gated by margin)
+                double qdd_i = gain * (term_lower - term_upper);
+
+                // Clamp reference acceleration within the same bounds used in constraints
+                double l_i = -inf;
+                double u_i = +inf;
+
+                double vlim = 0.0;
+                if (have_velocity_limits_) vlim = v_limit_arm_[i];
+                if (!(vlim > 0.0)) vlim = joint_vel_limit_;
+                const double dq_min = -std::abs(vlim);
+                const double dq_max = +std::abs(vlim);
+                const double l_vel = (dq_min - qd_arm_meas[i]) / dt;
+                const double u_vel = (dq_max - qd_arm_meas[i]) / dt;
+                l_i = std::max(l_i, l_vel);
+                u_i = std::min(u_i, u_vel);
+
+                if (have_position_limits_ && std::isfinite(q_lower_arm_[i]) && std::isfinite(q_upper_arm_[i])) {
+                    const double l_pos = (2.0 * (q_lower_arm_[i] - q_arm_meas[i] - dt * qd_arm_meas[i])) / dt2;
+                    const double u_pos = (2.0 * (q_upper_arm_[i] - q_arm_meas[i] - dt * qd_arm_meas[i])) / dt2;
+                    l_i = std::max(l_i, l_pos);
+                    u_i = std::min(u_i, u_pos);
+                }
+
+                if (std::isfinite(l_i) && std::isfinite(u_i) && l_i <= u_i) {
+                    qdd_i = std::clamp(qdd_i, l_i, u_i);
+                }
+
+                qdd_rep[i] = qdd_i;
+            }
+
+            qp_P_dense_.diagonal().array() += w_lim;
+            qp_gradient_.noalias() += -(w_lim * qdd_rep);
+        }
     }
 
     // 9. Vincoli box su qdd (derivati da limiti vel/pos discretizzati)

@@ -63,7 +63,7 @@ If no or invalid input is given by the user, the desired relative EE pose comman
 For running the controller 
 
 ```bash
-ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=50.0 -p k_err_vel_:=50.0 -p control_rate_hz:=120.0 -p redundant:=true -p w_kin:=1.0 -p w_dyn:=1.0 -p qp_lambda_reg:=1e-2 -p w_damp:=0.2 -p k_damp:=2.0
+ros2 run clik2_node_pkg clik_uam_node --ros-args -p k_err_pos_:=50.0 -p k_err_vel_:=50.0 -p control_rate_hz:=120.0 -p redundant:=true -p w_kin:=1.0 -p qp_lambda_reg:=1e-2 -p w_damp:=0.2 -p k_damp:=2.0 -p w_lim:=1e-2 -p jlim_gain:=0.05 -p -p w_com:=0.0 -p k_com_vel:=0.0
 ```
 
 
@@ -89,6 +89,10 @@ Parameter      |Default value |   Description    |
 |`lambda_w` | `10.0` | Sets if to give priority to trajectory tracking or to reaction torque minimization. If `lambda_w>1.0` you give more priority to trajectory tracking while if `0.0<lambda_w<1.0`.
 |`w_kin`, `w_dyn`, `w_damp`| `1.0`, `1.0`, `0.2`| These are the weights that can be used to set tasks priority
 |`k_damp`| `2.0` | Is the proportional gain for damping task
+|`w_lim`| `0.0` | Weight of the soft repulsion task from joint limits (barrier functions). Set `>0` to enable.
+|`jlim_gain`| `0.05` | Repulsion intensity used to build the reference joint acceleration.
+|`jlim_margin`| `0.3` | Activation margin (rad) from joint limits. Far from limits the behavior is almost unchanged.
+|`jlim_eps`| `1e-3` | Numerical epsilon (rad) to avoid singularities when very close to a limit.
 
 ## Usage with real system (Motion Capture)
 
@@ -122,7 +126,7 @@ This should also open a Rviz session where it is possible to visualize the confi
 
 6. Run the controller
 ```bash
-ros2 run clik2_node_pkg clik_uam_node --ros-args -p use_gazebo_pose:=false -p real_system:=true -p shoulder_weight:=20.0 -p k_err_pos_:=30.0 -p k_err_vel_:=20.0 -p control_rate_hz:=120.0 -p redundant:=true -p w_kin:=4.0 -p w_dyn:=0.0 -p qp_lambda_reg:=1e-3 -p w_damp:=1e-1 -p k_damp:=1.0 -p w_com:=1.0 -p k_com_vel:=100.0
+ros2 run clik2_node_pkg clik_uam_node --ros-args -p use_gazebo_pose:=false -p real_system:=true -p shoulder_weight:=20.0 -p k_err_pos_:=30.0 -p k_err_vel_:=20.0 -p control_rate_hz:=120.0 -p redundant:=true -p w_kin:=1.0 -p qp_lambda_reg:=1e-3 -p w_damp:=1e-1 -p k_damp:=1.0 -p w_com:=1.0 -p k_com_vel:=1.0 -p w_lim:=1e-2 -p jlim_gain:=0.05
 ```
 7. Run the planner
 ```bash
@@ -170,7 +174,7 @@ Optionally, `real_drone_vel_pub` can estimate angular velocity from the `/t960a/
 The controller computes **joint accelerations** $\ddot{\mathbf{q}}$ by solving, at each control step, the following optimization problem:
 
 $$
-\ddot{\mathbf{q}} = \text{argmin} \| [\mathbf{J}_{gen}]\ddot{\mathbf{q}} - \dot{\mathbf{v}}_{des} \|_{W_{kin}} +  \| [\mathbf{H}_{M_R}]\ddot{\mathbf{q}} + \mathbf{n}_{M_R} \|_{W_{dyn}} + \|\ddot{\mathbf{q}} + k_d \dot{\mathbf{q}}\|_{{W}_{damp}}
+\ddot{\mathbf{q}} = \text{argmin} \| [\mathbf{J}_{gen}]\ddot{\mathbf{q}} - \dot{\mathbf{v}}_{des} \|_{W_{kin}} +  \| [\mathbf{H}_{M_R}]\ddot{\mathbf{q}} + \mathbf{n}_{M_R} \|_{W_{dyn}} + \|\ddot{\mathbf{q}} + k_d \dot{\mathbf{q}}\|_{{W}_{damp}} + w_{lim}\,\|\ddot{\mathbf{q}}-\ddot{\mathbf{q}}_{rep}(\mathbf{q})\|^2
 $$
 
 where:
@@ -180,6 +184,20 @@ where:
 * $\mathbf{H}_{M_R}$ is the **reaction-moment inertia submatrix** (rows 3–6) of the **manipulator-only inertia matrix**,
 * $\mathbf{n}_{M_R}$ is the corresponding nonlinear term (Coriolis + centrifugal + gravity contribution, consistent with $\mathbf{H}_{M_R}$),
 * $W_{kin}, W_{dyn}, W_{damp}$ is a scalar weight tuning the trade-off between tracking and reaction minimization.
+
+The **joint-limit repulsion reference** $\ddot{\mathbf{q}}_{rep}(\mathbf{q})$ (enabled when `w_lim>0`) is built from a (gated) **log-barrier** gradient. For each joint $i$ with finite position limits $q_{min,i}$, $q_{max,i}$, define the distances
+
+$$
+d_{low,i} = q_i - q_{min,i},\qquad d_{up,i} = q_{max,i} - q_i
+$$
+
+and the activation margin $m$=`jlim_margin` and numerical epsilon $\varepsilon$=`jlim_eps`. The reference acceleration is computed element-wise as
+
+$$
+\ddot{q}_{rep,i} = k_{lim}\left(\frac{\mathbb{I}(d_{low,i}<m)}{\max(d_{low,i},\varepsilon)} - \frac{\mathbb{I}(d_{up,i}<m)}{\max(d_{up,i},\varepsilon)}\right)
+$$
+
+where $k_{lim}$=`jlim_gain` and $\mathbb{I}(\cdot)$ is the indicator function (1 if the condition holds, else 0). This makes the term **almost zero when far from the limits** (outside the margin) and increasingly repulsive as a joint approaches a bound. In the implementation, $\ddot{q}_{rep,i}$ is also clamped within the same acceleration bounds used by the QP constraints.
 
 For more info check the paper (please consider citing):
 

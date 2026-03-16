@@ -123,6 +123,14 @@ private:
     // min || J_com_arm * qdd_arm + d/dt(J_com_arm) * qd_arm ||^2
     double w_com_ = 0.0;
 
+    // Soft repulsion from joint limits (barrier-based)
+    // Adds a quadratic term ||qdd_arm - qdd_rep(q)||^2 weighted by w_lim_
+    // qdd_rep is computed from a (gated) log barrier gradient.
+    double w_lim_ = 0.0;
+    double jlim_gain_ = 0.05;
+    double jlim_margin_ = 0.3;
+    double jlim_eps_ = 1e-3;
+
     // Guadagno del termine di smorzamento sulla velocità del CoM (via accelerazione):
     // min || J_com_arm*qdd_arm + d/dt(J_com_arm)*qd_arm + k_com_vel * v_com_arm ||^2
     // con v_com_arm ~= J_com_arm * qd_arm (solo contributo dei giunti del braccio).
