@@ -861,12 +861,16 @@ void PlannerNode::run_polyline_trajectory() {
 
   Eigen::Quaterniond q_world_ee_current(1, 0, 0, 0);
   bool have_q_world_ee_current = false;
+  geometry_msgs::msg::Pose ee_pose_world_fk_at_start;
+  bool have_ee_pose_world_fk_at_start = false;
   if (use_default_polyline) {
+    // Richiesta: ricava SEMPRE la posa iniziale dell'EE via FK (non usare /ee_world_pose).
     rclcpp::Rate r(50);
     for (int i = 0; i < 50 && rclcpp::ok() && !has_joint_state_; ++i) {
       rclcpp::spin_some(this->get_node_base_interface());
       r.sleep();
     }
+
     Eigen::VectorXd q = pinocchio::neutral(model_);
     q[0] = vehicle_local_position_.x;
     q[1] = vehicle_local_position_.y;
@@ -884,24 +888,37 @@ void PlannerNode::run_polyline_trajectory() {
         if (idx_q >= 7 && idx_q < q.size()) q[idx_q] = current_joint_state_.position[i];
       }
     }
+
     pinocchio::forwardKinematics(model_, data_, q);
     pinocchio::updateFramePlacements(model_, data_);
     const pinocchio::SE3 &T_world_ee_now = data_.oMf[ee_frame_id_];
-    q_world_ee_current = Eigen::Quaterniond(T_world_ee_now.rotation());
-    q_world_ee_current.normalize();
+
+    ee_pose_world_fk_at_start.position.x = T_world_ee_now.translation().x();
+    ee_pose_world_fk_at_start.position.y = T_world_ee_now.translation().y();
+    ee_pose_world_fk_at_start.position.z = T_world_ee_now.translation().z();
+    Eigen::Quaterniond q_fk(T_world_ee_now.rotation());
+    q_fk.normalize();
+    ee_pose_world_fk_at_start.orientation.x = q_fk.x();
+    ee_pose_world_fk_at_start.orientation.y = q_fk.y();
+    ee_pose_world_fk_at_start.orientation.z = q_fk.z();
+    ee_pose_world_fk_at_start.orientation.w = q_fk.w();
+    have_ee_pose_world_fk_at_start = true;
+
+    q_world_ee_current = q_fk;
     have_q_world_ee_current = true;
+
     tf2::Vector3 p_world(
       T_world_ee_now.translation().x(),
       T_world_ee_now.translation().y(),
       T_world_ee_now.translation().z());
     tf2::Vector3 p_local_tf = tf_world_from_arm_base0.inverse() * p_world;
-    Eigen::Vector3d p0_local(p_local_tf.x(), p_local_tf.y(), p_local_tf.z());
+    const Eigen::Vector3d p0_local(p_local_tf.x(), p_local_tf.y(), p_local_tf.z());
     wps_local.clear();
     wps_local.push_back({p0_local, false, Eigen::Quaterniond(1, 0, 0, 0)});
     wps_local.push_back({Eigen::Vector3d(0.45, 0.0, 0.38), false, Eigen::Quaterniond(1, 0, 0, 0)});
-    wps_local.push_back({Eigen::Vector3d(0.45, 0.0, 0.2), false, Eigen::Quaterniond(1, 0, 0, 0)});
-    wps_local.push_back({Eigen::Vector3d(0.25, 0.0, 0.2), false, Eigen::Quaterniond(1, 0, 0, 0)});
-    wps_local.push_back({Eigen::Vector3d(0.25, 0.0, 0.38), false, Eigen::Quaterniond(1, 0, 0, 0)});
+    wps_local.push_back({Eigen::Vector3d(0.45, 0.0, 0.23), false, Eigen::Quaterniond(1, 0, 0, 0)});
+    wps_local.push_back({Eigen::Vector3d(0.275, 0.0, 0.23), false, Eigen::Quaterniond(1, 0, 0, 0)});
+    wps_local.push_back({Eigen::Vector3d(0.275, 0.0, 0.38), false, Eigen::Quaterniond(1, 0, 0, 0)});
     wps_local.push_back({Eigen::Vector3d(0.45, 0.0, 0.38), false, Eigen::Quaterniond(1, 0, 0, 0)});
   }
 
@@ -913,14 +930,28 @@ void PlannerNode::run_polyline_trajectory() {
   // Espandi la lista dei waypoints per ripetere la traiettoria.
   // Nota: per ripetizioni > 1 viene aggiunto un tratto di rientro dall'ultimo WP al primo WP,
   // poi la sequenza riparte.
+  auto same_wp = [](const WP& a, const WP& b) {
+    const double pos_eps = 1e-10;
+    if ((a.p - b.p).squaredNorm() > pos_eps) return false;
+    if (a.has_q != b.has_q) return false;
+    if (!a.has_q && !b.has_q) return true;
+    const double dot = std::abs(a.q.dot(b.q));
+    return (1.0 - dot) < 1e-12;
+  };
+  auto append_wp_if_new = [&](std::vector<WP>& out, const WP& wp) {
+    if (out.empty() || !same_wp(out.back(), wp)) out.push_back(wp);
+  };
   if (repeats > 1) {
     const std::vector<WP> base = wps_local;
     wps_local.clear();
-    wps_local.reserve(base.size() + static_cast<size_t>(repeats - 1) * (base.size() + 1));
-    wps_local.insert(wps_local.end(), base.begin(), base.end());
-    for (int k = 1; k < repeats; ++k) {
-      wps_local.push_back(base.front());
-      wps_local.insert(wps_local.end(), base.begin() + 1, base.end());
+    wps_local.reserve(base.size() * static_cast<size_t>(repeats) + static_cast<size_t>(repeats));
+    for (int k = 0; k < repeats; ++k) {
+      if (k == 0) {
+        for (const auto& wp : base) append_wp_if_new(wps_local, wp);
+      } else {
+        append_wp_if_new(wps_local, base.front());
+        for (size_t j = 1; j < base.size(); ++j) append_wp_if_new(wps_local, base[j]);
+      }
     }
   }
 
@@ -941,16 +972,16 @@ void PlannerNode::run_polyline_trajectory() {
   };
 
   Eigen::Quaterniond q_world_ref(1, 0, 0, 0);
-  const double ee_wait_timeout_s_poly = 0.5;
-  rclcpp::Time ee_wait_t0_poly = this->now();
-  while (rclcpp::ok() && !has_current_ee_pose_ &&
-         (this->now() - ee_wait_t0_poly).seconds() < ee_wait_timeout_s_poly) {
-    rclcpp::spin_some(this->get_node_base_interface());
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
 
   geometry_msgs::msg::Pose first_pose_world = to_world_pose(wps_local.front());
-  if (has_current_ee_pose_) {
+  if (use_default_polyline && have_ee_pose_world_fk_at_start) {
+    first_pose_world = ee_pose_world_fk_at_start;
+    q_world_ref = Eigen::Quaterniond(first_pose_world.orientation.w,
+                                     first_pose_world.orientation.x,
+                                     first_pose_world.orientation.y,
+                                     first_pose_world.orientation.z);
+    q_world_ref.normalize();
+  } else if (has_current_ee_pose_) {
     first_pose_world = current_ee_pose_;
     q_world_ref = Eigen::Quaterniond(first_pose_world.orientation.w,
                                      first_pose_world.orientation.x,
